@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          if [[ -f requirements.lock ]]; then
+            python -m pip install --require-hashes --requirement requirements.lock
+          else
+            python -m pip install --requirement requirements-dev.txt
+          fi
+      - name: Compile
+        run: python -m compileall -q src lambda scripts tests
+      - name: Shell syntax
+        run: bash -n lambda/deploy.sh scripts/clean_clone_smoke.sh
+      - name: Inventory
+        run: python scripts/verify_release.py
+      - name: Boundary
+        run: python scripts/check_boundary.py .
+      - name: Secrets
+        run: |
+          python scripts/check_secrets.py --worktree
+          python scripts/check_secrets.py --history
+      - name: License boundary
+        run: python scripts/check_license_boundary.py
+      - name: Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Mypy
+        run: mypy
+      - name: Tests
+        run: pytest -q
+      - name: Bandit
+        run: bandit -q -r src lambda scripts
+      - name: Dependency audit
+        run: |
+          if [[ -f requirements.lock ]]; then
+            pip-audit --requirement requirements.lock
+          else
+            pip-audit --requirement requirements-dev.txt
+          fi

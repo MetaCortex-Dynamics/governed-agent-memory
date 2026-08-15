@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "use": "citation-and-independent-implementation-only",
+  "sources": [
+    {
+      "role": "verdict tokens and ordering",
+      "title": "Your Loop Has Two States. It Needs Four.",
+      "author": "Devon Generally / MetaCortex Dynamics",
+      "date": "2026-07-09",
+      "url": "https://metacortexdynamics.substack.com/p/your-loop-has-two-states-it-needs",
+      "license": "citation-only unless separately granted"
+    },
+    {
+      "role": "fifteen public operator-family names",
+      "title": "The Operator Completeness Theorem: The 15 Invariant Operators as Constitutive Conditions of Projection",
+      "author": "Devon A. Generally",
+      "date": "2026-05-25",
+      "doi": "10.5281/zenodo.20370848",
+      "license": "CC BY-NC-ND 4.0"
+    },
+    {
+      "role": "pre-numeric thesis",
+      "title": "Operators, Not Numbers: 0 and 1 as Pre-Numeric Structure",
+      "author": "Devon A. Generally",
+      "date": "2026-07-22",
+      "doi": "10.5281/zenodo.21499659",
+      "license": "CC BY 4.0"
+    },
+    {
+      "role": "seven witness names",
+      "title": "The Universal Interrogative Theorem: The Constitutive Grammar of Appearing-Being",
+      "author": "Devon A. Generally",
+      "date": "2026-07-21",
+      "doi": "10.5281/zenodo.21465420",
+      "license": "CC BY-ND 4.0"
+    }
+  ]
+}

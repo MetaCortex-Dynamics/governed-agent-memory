@@ -1,0 +1,1 @@
+-- This scaffold performs no DDL; the CockroachDB schema is not implemented.

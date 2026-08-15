@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "trace_mode": "sparse",
+  "active_operator_families": [
+    "THIS",
+    "SAME/NOT-SAME",
+    "IF/THEN",
+    "BECAUSE",
+    "INSIDE/OUTSIDE",
+    "NEAR/FAR",
+    "CAN/CANNOT",
+    "TOGETHER/ALONE",
+    "MORE/LESS",
+    "EVERY/SOME"
+  ],
+  "inactive_operator_families": [
+    "GOES-WITH",
+    "MANY/ONE",
+    "NO",
+    "MAYBE",
+    "MUST/LET"
+  ],
+  "witness_gap_types": [
+    "WHAT",
+    "WHERE",
+    "WHICH",
+    "WHEN",
+    "FOR-WHAT",
+    "HOW",
+    "WHENCE"
+  ],
+  "verdict_identity": {
+    "NO": 0,
+    "YES": 1,
+    "MAYBE": 2,
+    "IFF": 3
+  }
+}
