@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -13,7 +14,9 @@ import pytest
 import src.consequences as consequences
 from src.consequences import DivergenceLeaf, compare_json, report_consequence
 from src.memory import MemoryConflictError, MemoryIntegrityError
-from src.models import ConsequenceReport
+from src.models import CheckResult, ConsequenceRef, ConsequenceReport, ExecutionStatus
+
+fixtures: Any = importlib.import_module("tests.unit.test_governance_rules")
 
 
 class SerializationFailure(RuntimeError):
@@ -103,6 +106,124 @@ def receipt_row() -> dict[str, Any]:
     receipt = consequences._receipt_from_row(row)
     row["receipt_digest"] = consequences._receipt_digest(receipt)
     return row
+
+
+def report_fixture(
+    consequence_id: str = "20000000-0000-0000-0000-000000000001",
+    *,
+    divergence: Decimal = Decimal("0.750000"),
+) -> tuple[ConsequenceReport, dict[str, Any]]:
+    provisional = ConsequenceReport(
+        consequence_id=consequence_id,
+        proposal_id="20000000-0000-0000-0000-000000000002",
+        receipt_id="20000000-0000-0000-0000-000000000003",
+        receipt_terminal_status=ExecutionStatus.OBSERVED,
+        receipt_digest="1" * 64,
+        observation_number=1,
+        predicted_snapshot_digest="2" * 64,
+        actual_snapshot_digest="3" * 64,
+        comparison_version="json-divergence-v1",
+        predicted_outcome_json="{}",
+        actual_outcome_json="{}",
+        leaf_report_json="[]",
+        divergence_score=divergence,
+        divergence_threshold=Decimal("0.500000"),
+        divergence_summary="MORE",
+        reported_by="human",
+        report_digest="0" * 64,
+        idempotency_key=f"report-{consequence_id}",
+    )
+    report = replace(
+        provisional,
+        report_digest=consequences._record_digest(
+            provisional, "gam.consequence-report.v1", "report_digest"
+        ),
+    )
+    row = {
+        "id": report.consequence_id,
+        "consequence_id": report.consequence_id,
+        **{
+            field: getattr(report, field)
+            for field in (
+                "proposal_id",
+                "receipt_id",
+                "receipt_digest",
+                "observation_number",
+                "predicted_snapshot_digest",
+                "actual_snapshot_digest",
+                "comparison_version",
+                "divergence_score",
+                "divergence_threshold",
+                "divergence_summary",
+                "reported_by",
+                "report_digest",
+                "idempotency_key",
+            )
+        },
+        "receipt_terminal_status": report.receipt_terminal_status.value,
+        "predicted_outcome": report.predicted_outcome_json,
+        "actual_outcome": report.actual_outcome_json,
+        "leaf_report": report.leaf_report_json,
+    }
+    return report, row
+
+
+class OrchestrationConnection:
+    def __init__(
+        self, latest: Mapping[str, Any], reports: list[dict[str, Any]]
+    ) -> None:
+        self.latest = latest
+        self.reports = reports
+
+    async def fetchrow(self, query: str, *args: object) -> Mapping[str, Any] | None:
+        if "gate_evaluations" in query:
+            return self.latest
+        if "consequence_reports" in query:
+            wanted = str(args[0])
+            return next(
+                (row for row in self.reports if row["consequence_id"] == wanted),
+                None,
+            )
+        raise AssertionError(query)
+
+    async def fetch(self, query: str, *args: object) -> tuple[Mapping[str, Any], ...]:
+        assert "consequence_reports" in query
+        wanted = {str(item) for item in cast(tuple[object, ...], args[0])}
+        return tuple(row for row in self.reports if row["consequence_id"] in wanted)
+
+
+class OrchestrationMemory:
+    def __init__(
+        self,
+        proposal: Any,
+        precedents: tuple[Any, ...],
+        latest: Mapping[str, Any],
+        reports: list[dict[str, Any]],
+    ) -> None:
+        self.proposal = proposal
+        self.precedents = precedents
+        self.connection = OrchestrationConnection(latest, reports)
+        self.appended: list[tuple[Any, Any]] = []
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[OrchestrationConnection]:
+        yield self.connection
+
+    async def get_proposal(self, _proposal_id: str) -> Any:
+        return self.proposal
+
+    async def search_precedents(
+        self, _embedding: tuple[float, ...], limit: int, _evaluation_id: str
+    ) -> tuple[Any, ...]:
+        assert limit == 5
+        return self.precedents
+
+    async def get_exclusions(self, _action: str, _target: str) -> tuple[Any, ...]:
+        return ()
+
+    async def append_re_evaluation(self, snapshot: Any, result: Any) -> tuple[str, str]:
+        self.appended.append((snapshot, result))
+        return snapshot.proposal.proposal_id, result.evaluation_id
 
 
 def test_worked_fixture_and_leaf_order() -> None:
@@ -271,3 +392,94 @@ async def test_serialization_retry_appends_exactly_once(
     assert report.idempotency_key == "retry"
     assert memory.transaction_count == 2
     assert memory.append_count == 1
+
+
+@pytest.mark.asyncio
+async def test_warning_retrieval_requires_exact_same_after_near(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, row = report_fixture()
+    proposal = fixtures.make_proposal()
+    consequence_ref = ConsequenceRef(
+        consequence_id=report.consequence_id,
+        receipt_id=report.receipt_id,
+        receipt_terminal_status=report.receipt_terminal_status,
+        receipt_digest=report.receipt_digest,
+        predicted_snapshot_digest=report.predicted_snapshot_digest,
+        actual_snapshot_digest=report.actual_snapshot_digest,
+        comparison_version=report.comparison_version,
+        divergence=report.divergence_score,
+        divergence_threshold=report.divergence_threshold,
+        report_digest=report.report_digest,
+    )
+    same = fixtures.make_precedent(consequences=(consequence_ref,))
+    different = fixtures.make_precedent(
+        target_key="different", consequences=(consequence_ref,), proposal_id="other"
+    )
+    memory = OrchestrationMemory(
+        proposal,
+        (same, different),
+        {"id": "evaluation-current"},
+        [row],
+    )
+    monkeypatch.setattr(consequences, "_APP_MEMORY", memory)
+    warnings = await consequences.get_divergence_warnings(
+        UUID("30000000-0000-0000-0000-000000000001")
+    )
+    assert warnings == (report,)
+
+
+@pytest.mark.asyncio
+async def test_reevaluation_appends_new_genealogy_without_mutating_prior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, row = report_fixture()
+    consequence_ref = ConsequenceRef(
+        consequence_id=report.consequence_id,
+        receipt_id=report.receipt_id,
+        receipt_terminal_status=report.receipt_terminal_status,
+        receipt_digest=report.receipt_digest,
+        predicted_snapshot_digest=report.predicted_snapshot_digest,
+        actual_snapshot_digest=report.actual_snapshot_digest,
+        comparison_version=report.comparison_version,
+        divergence=report.divergence_score,
+        divergence_threshold=report.divergence_threshold,
+        report_digest=report.report_digest,
+    )
+    base = fixtures.make_snapshot(
+        precedents=(fixtures.make_precedent(consequences=(consequence_ref,)),)
+    )
+    prior = fixtures.evaluate(base)
+    assert isinstance(prior, CheckResult)
+    prior_bytes = prior.trace_digest
+    latest_row = {"input_snapshot": "stored", "id": prior.evaluation_id}
+    memory = OrchestrationMemory(base.proposal, base.precedents, latest_row, [row])
+    monkeypatch.setattr(consequences, "_APP_MEMORY", memory)
+    monkeypatch.setattr(consequences, "_result_from_row", lambda _row: prior)
+    monkeypatch.setattr(consequences, "_snapshot_from_json", lambda _value: base)
+    monkeypatch.setattr(consequences, "finalize_snapshot", lambda snapshot: snapshot)
+
+    def evaluate(snapshot: Any, _config: Any) -> CheckResult:
+        return replace(
+            prior,
+            evaluation_id=snapshot.evaluation_id,
+            prior_evaluation_id=prior.evaluation_id,
+            changed_fact_rule_ids=("F08_DIVERGENCE_BOUNDARY",),
+            input_snapshot_digest=snapshot.snapshot_digest,
+            trace_digest="9" * 64,
+        )
+
+    monkeypatch.setattr(consequences, "evaluate_proposal", evaluate)
+    result = await consequences.reevaluate_with_consequence(
+        UUID("30000000-0000-0000-0000-000000000002"),
+        UUID(report.consequence_id),
+        "human",
+    )
+    assert result.prior_evaluation_id == prior.evaluation_id
+    assert result.changed_fact_rule_ids == ("F08_DIVERGENCE_BOUNDARY",)
+    assert len(memory.appended) == 1
+    assert prior.trace_digest == prior_bytes
+    snapshot, appended = memory.appended[0]
+    assert snapshot.prior_evaluation is not None
+    assert snapshot.prior_evaluation.trace_digest == prior_bytes
+    assert appended is result
