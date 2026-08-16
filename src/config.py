@@ -30,6 +30,7 @@ _FORBIDDEN_APP_USERS = frozenset(
 )
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+_VERSION = re.compile(r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 _CLUSTER_NAME = "governed-agent-memory"
 _DATABASE_NAME = "governed_agent_memory"
 _COCKROACH_VERSION = "v26.2.1"
@@ -179,7 +180,6 @@ class BoundCrdbVersion:
             "target_regions": ("us-east-1",),
             "target_spend_limit_usd": "0",
             "vector_docs_url": _VECTOR_DOCS_URL,
-            "ccloud_version": _COCKROACH_VERSION,
         }
         for name, expected in literal.items():
             if getattr(self, name) != expected:
@@ -202,6 +202,11 @@ class BoundCrdbVersion:
             _require_digest(cast(str, getattr(self, name)), name)
         if self.cluster_name_digest != _digest(_CLUSTER_NAME.encode("utf-8")):
             raise ConfigError("bound cluster-name digest mismatch")
+        if (
+            _VERSION.fullmatch(self.ccloud_version) is None
+            or self.ccloud_version == self.cockroach_version
+        ):
+            raise ConfigError("bound ccloud version domain is invalid")
         if self.ccloud_json_flag not in {"--output=json", "--format=json", "--json"}:
             raise ConfigError("bound ccloud JSON flag is invalid")
         executable = Path(self.ccloud_executable)

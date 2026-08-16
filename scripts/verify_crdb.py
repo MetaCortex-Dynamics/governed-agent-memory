@@ -261,7 +261,7 @@ def preflight_config(
 def atomic_artifact(value: Mapping[str, Any]) -> None:
     """Write the complete version artifact atomically."""
     VERSION_ARTIFACT.parent.mkdir(parents=True, exist_ok=True)
-    content = canonical_bytes(value) + b"\n"
+    content = canonical_bytes(value)
     with tempfile.NamedTemporaryFile(
         dir=VERSION_ARTIFACT.parent, prefix=".crdb-version.", delete=False
     ) as handle:

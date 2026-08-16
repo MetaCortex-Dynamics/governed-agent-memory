@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import runpy
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,6 +17,8 @@ from src.config import (
     ConfigError,
     EmbeddingConfig,
 )
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def digest(value: bytes) -> str:
@@ -53,7 +57,7 @@ def artifact_fixture(tmp_path: Path) -> tuple[Path, str]:
         "vector_docs_url": "https://www.cockroachlabs.com/docs/v26.2/vector-indexes",
         "ccloud_executable": str(executable.resolve()),
         "ccloud_executable_sha256": digest(executable.read_bytes()),
-        "ccloud_version": "v26.2.1",
+        "ccloud_version": "v0.6.12",
         "ccloud_version_raw_digest": "8" * 64,
         "ccloud_help_digest": "9" * 64,
         "ccloud_config_digest": "a" * 64,
@@ -143,12 +147,34 @@ def test_bound_crdb_artifact_and_ccloud_environment_are_exact(
     assert isinstance(config.bound_version, BoundCrdbVersion)
     assert profile not in repr(config)
     assert "postgresql://" not in repr(config)
+    assert config.bound_version.cockroach_version == "v26.2.1"
+    assert config.bound_version.ccloud_version == "v0.6.12"
+    assert config.bound_version.ccloud_version != config.bound_version.cockroach_version
+
+
+def test_preflight_writer_round_trips_exactly_through_bound_loader(
+    tmp_path: Path,
+) -> None:
+    source, _ = artifact_fixture(tmp_path)
+    value = json.loads(source.read_bytes())
+    output = tmp_path / "writer" / "crdb-version.json"
+    namespace: dict[str, Any] = runpy.run_path(str(ROOT / "scripts/verify_crdb.py"))
+    writer = namespace["atomic_artifact"]
+    writer.__globals__["VERSION_ARTIFACT"] = output
+    writer(value)
+    assert output.read_bytes() == canonical(value)
+    assert not output.read_bytes().endswith(b"\n")
+    loaded = BoundCrdbVersion.load(output)
+    assert loaded.cockroach_version == "v26.2.1"
+    assert loaded.ccloud_version == "v0.6.12"
 
 
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
         ({"target_cloud": "GCP"}, "target_cloud"),
+        ({"ccloud_version": "v26.2.1"}, "version domain"),
+        ({"ccloud_version": "0.6.12"}, "version domain"),
         ({"expected_cluster_id_digest": "f" * 64}, "capture digest"),
         ({"capture_digest": "f" * 64}, "capture digest"),
         ({"extra": "value"}, "fields differ"),
