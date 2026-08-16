@@ -115,6 +115,19 @@ PLACEHOLDERS = {
     "src/witnesses.py": '"""Witness gaps are unavailable in this scaffold."""\n',
 }
 
+DATABASE_PHASE_PATHS = {
+    "schema/roles.sql",
+    "scripts/verify_crdb.py",
+    "tests/integration/test_schema_live.py",
+}
+PUBLIC_CONTRACT_PHASE_PATHS = {
+    "src/verdict.py",
+    "src/operators.py",
+    "src/witnesses.py",
+    "src/models.py",
+    "src/traces.py",
+}
+
 
 def git_inventory(root: Path) -> tuple[str, ...]:
     """Read a strict NUL-delimited tracked inventory."""
@@ -179,7 +192,42 @@ def verify_inventory(root: Path, initial_exact: bool) -> None:
             raise ValueError("file mode mismatch")
 
 
-def verify_content(root: Path) -> None:
+def _verify_phase(root: Path, *, initial_exact: bool) -> None:
+    """Require complete packet phases and reject partial placeholder transitions."""
+    if initial_exact:
+        for relative, expected in PLACEHOLDERS.items():
+            if (root / relative).read_text(encoding="utf-8") != expected:
+                raise ValueError("initial placeholder ownership")
+        return
+    database_phase_present = {
+        path for path in DATABASE_PHASE_PATHS if (root / path).is_file()
+    }
+    if database_phase_present and database_phase_present != DATABASE_PHASE_PATHS:
+        raise ValueError("partial database implementation phase")
+    if database_phase_present:
+        if (root / "src/ccloud_tool.py").read_text(encoding="utf-8") == PLACEHOLDERS[
+            "src/ccloud_tool.py"
+        ]:
+            raise ValueError("ccloud implementation missing")
+        if (
+            (root / "schema/init.sql")
+            .read_text(encoding="utf-8")
+            .startswith("-- This scaffold")
+        ):
+            raise ValueError("schema implementation missing")
+    public_contracts_implemented = {
+        path
+        for path in PUBLIC_CONTRACT_PHASE_PATHS
+        if (root / path).read_text(encoding="utf-8") != PLACEHOLDERS[path]
+    }
+    if (
+        public_contracts_implemented
+        and public_contracts_implemented != PUBLIC_CONTRACT_PHASE_PATHS
+    ):
+        raise ValueError("partial public-contract implementation phase")
+
+
+def verify_content(root: Path, *, initial_exact: bool) -> None:
     """Verify the persistent scaffold contracts."""
     if (root / ".python-version").read_text(encoding="utf-8") != "3.12\n":
         raise ValueError("python version")
@@ -195,7 +243,19 @@ def verify_content(root: Path) -> None:
             raise ValueError("dependency duplication")
     env_lines = (root / ".env.example").read_text(encoding="utf-8").splitlines()
     values = dict(line.split("=", 1) for line in env_lines)
-    if values.get("DATABASE_URL") != "" or values.get("OPENAI_API_KEY") != "":
+    database_names = {
+        "DATABASE_URL",
+        "DATABASE_URL_APP",
+        "DATABASE_URL_DECIDER",
+        "DATABASE_URL_EXECUTOR",
+        "DATABASE_URL_SCHEMA_ADMIN",
+    }
+    present_database_names = database_names.intersection(values)
+    if (
+        not present_database_names
+        or any(values[name] != "" for name in present_database_names)
+        or values.get("OPENAI_API_KEY") != ""
+    ):
         raise ValueError("sensitive example value")
     boundary = json.loads(
         (root / "config/public-boundary.json").read_text(encoding="utf-8")
@@ -221,9 +281,7 @@ def verify_content(root: Path) -> None:
         root / "docs/devpost-draft.md"
     ).read_text(encoding="utf-8"):
         raise ValueError("draft marker")
-    for relative, expected in PLACEHOLDERS.items():
-        if (root / relative).read_text(encoding="utf-8") != expected:
-            raise ValueError("placeholder ownership")
+    _verify_phase(root, initial_exact=initial_exact)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -234,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = Path.cwd().resolve(strict=True)
         verify_inventory(root, arguments == ["--initial-exact"])
-        verify_content(root)
+        verify_content(root, initial_exact=arguments == ["--initial-exact"])
     except (
         OSError,
         UnicodeError,

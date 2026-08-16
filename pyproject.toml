@@ -33,6 +33,14 @@ packages = ["src"]
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
 testpaths = ["tests"]
+markers = [
+  "live_crdb: requires separately configured live CockroachDB connections",
+  "live_lambda: requires a separately deployed live AWS Lambda target",
+  "live_openai: requires separately configured live OpenAI access",
+  "live_ccloud: requires a separately configured live ccloud identity",
+  "phase_skeleton: applies only to the initial scaffold",
+  "phase_implementation: applies after an implementation packet has merged",
+]
 
 [tool.ruff]
 target-version = "py312"

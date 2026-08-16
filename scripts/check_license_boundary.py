@@ -11,6 +11,7 @@ from pathlib import Path
 
 LICENSE_DIGEST = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
 FORBIDDEN_SUFFIXES = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".zip", ".tar", ".gz"}
+SELF = Path("scripts/check_license_boundary.py")
 
 
 def resolve_git() -> str:
@@ -71,6 +72,8 @@ def check(root: Path) -> None:
     for path in tracked_paths(root):
         if path.suffix.casefold() in FORBIDDEN_SUFFIXES:
             raise ValueError("deposited or archive file")
+        if path.relative_to(root) == SELF:
+            continue
         text = path.read_text(encoding="utf-8", errors="strict")
         if unrelated in text:
             raise ValueError("unrelated source")

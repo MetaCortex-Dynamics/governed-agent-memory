@@ -20,6 +20,40 @@ The following capabilities are planned and are not implemented in this scaffold:
 
 All planned capabilities remain unimplemented in this scaffold.
 
+## CockroachDB setup
+
+This phase defines the CockroachDB setup, access roles, vector indexing, and a
+bounded read-only `ccloud cluster info` evidence adapter. The cluster itself is
+provisioned separately; this
+repository never creates an account, cluster, network, billing configuration,
+login, password, API credential, or role membership.
+
+Deployment requires a pre-provisioned CockroachDB Cloud Basic cluster named
+`governed-agent-memory` on AWS in `us-east-1`, running CockroachDB
+`v26.2.1` with `feature.vector_index.enabled=true`. Keep all URLs and
+provider authentication outside Git. Each database URL must use
+`sslmode=verify-full`.
+
+The authorized deployment order is:
+
+```bash
+python scripts/verify_crdb.py preflight
+COCKROACH_URL="$DATABASE_URL_SCHEMA_ADMIN" cockroach sql \
+  --execute 'CREATE DATABASE governed_agent_memory'
+COCKROACH_URL="$DATABASE_URL_SCHEMA_ADMIN" cockroach sql \
+  --database governed_agent_memory --file schema/init.sql
+COCKROACH_URL="$DATABASE_URL_SCHEMA_ADMIN" cockroach sql \
+  --database governed_agent_memory --file schema/roles.sql
+python scripts/verify_crdb.py schema
+python scripts/verify_crdb.py grants
+python scripts/verify_crdb.py vector
+python -m src.ccloud_tool capture --purpose closure
+```
+
+The live commands are intentionally fail-closed when the external
+pre-provision record, opaque role bindings, pinned tool evidence, or TLS
+requirements are absent.
+
 ## Original-work disclosure
 
 > All submitted source code was written during the submission period. The

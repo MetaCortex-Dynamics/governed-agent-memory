@@ -112,7 +112,7 @@ def test_configuration_contracts() -> None:
 
 
 def test_placeholder_modules_import() -> None:
-    """Placeholders import without environment or network access."""
+    """Public modules import without environment or network access in every phase."""
     names = [
         "agent",
         "ccloud_tool",
@@ -137,7 +137,16 @@ def test_environment_example_is_blank_at_sensitive_fields() -> None:
     """Examples contain no credentials or credential-bearing URL."""
     text = (ROOT / ".env.example").read_text()
     values = dict(line.split("=", 1) for line in text.splitlines())
-    assert values["DATABASE_URL"] == ""
+    database_names = {
+        "DATABASE_URL",
+        "DATABASE_URL_APP",
+        "DATABASE_URL_DECIDER",
+        "DATABASE_URL_EXECUTOR",
+        "DATABASE_URL_SCHEMA_ADMIN",
+    }
+    present = database_names.intersection(values)
+    assert present
+    assert all(values[name] == "" for name in present)
     assert values["OPENAI_API_KEY"] == ""
     assert "://" not in text
 
