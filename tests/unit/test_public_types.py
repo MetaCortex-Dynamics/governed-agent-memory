@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -35,10 +35,10 @@ def _result() -> CheckResult:
         evidence_refs=(EvidenceRef("e-1", "fixture", DIGEST),),
     )
     reducer = ReducerTraceStep(
-        step_id=make_step_id(evaluation_id, 2, "R1"),
-        rule_id="R1",
+        step_id=make_step_id(evaluation_id, 2, "R4_YES"),
+        rule_id="R4_YES",
         family=OperatorFamily.EVERY_SOME,
-        pole="SOME",
+        pole="EVERY",
         decisive_fact_step_ids=(first.step_id,),
         result_json='"YES"',
     )
@@ -93,6 +93,29 @@ def test_trace_has_contiguous_ids_typed_reducer_and_terminal_because() -> None:
     assert isinstance(result.operator_trace[1], ReducerTraceStep)
     assert result.operator_trace[-1].step_id == result.because_step_id
     assert result.operator_trace[-1].family is OperatorFamily.BECAUSE
+
+
+@pytest.mark.parametrize(
+    ("legacy_rule_id", "pole"),
+    (("R1", "SOME"), ("R2", "SOME"), ("R3", "SOME"), ("R4", "EVERY")),
+)
+def test_abbreviated_reducer_ids_are_rejected(legacy_rule_id: str, pole: str) -> None:
+    original = _result()
+    first, reducer, because = original.operator_trace
+    assert isinstance(reducer, ReducerTraceStep)
+    assert isinstance(first, OperatorTraceStep)
+    assert isinstance(because, OperatorTraceStep)
+    legacy = replace(
+        reducer,
+        step_id=make_step_id(original.evaluation_id, 2, legacy_rule_id),
+        rule_id=legacy_rule_id,
+        pole=pole,
+    )
+    terminal = replace(because, object_refs=(legacy.step_id,))
+    with pytest.raises(ContractViolation, match="reducer family/pole"):
+        finalize_check_result(
+            replace(original, operator_trace=(first, legacy, terminal))
+        )
 
 
 def test_nonterminal_because_is_rejected() -> None:

@@ -55,10 +55,10 @@ _ENUM_TAGS: Mapping[type[Enum], str] = MappingProxyType(
 )
 _REDUCER_BINDINGS = MappingProxyType(
     {
-        "R1": (OperatorFamily.EVERY_SOME, "SOME"),
-        "R2": (OperatorFamily.EVERY_SOME, "SOME"),
-        "R3": (OperatorFamily.EVERY_SOME, "SOME"),
-        "R4": (OperatorFamily.EVERY_SOME, "EVERY"),
+        "R1_NO": (OperatorFamily.EVERY_SOME, "SOME"),
+        "R2_MAYBE": (OperatorFamily.EVERY_SOME, "SOME"),
+        "R3_IFF": (OperatorFamily.EVERY_SOME, "SOME"),
+        "R4_YES": (OperatorFamily.EVERY_SOME, "EVERY"),
     }
 )
 
