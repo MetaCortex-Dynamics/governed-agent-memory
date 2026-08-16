@@ -1,5 +1,3 @@
-"""Deterministic QG-005 consequence comparison checks."""
-
 from __future__ import annotations
 
 import json

@@ -1,5 +1,3 @@
-"""Credential-gated QG-005 CockroachDB contract checks."""
-
 from __future__ import annotations
 
 import os
