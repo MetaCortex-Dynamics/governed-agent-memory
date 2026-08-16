@@ -34,10 +34,11 @@ packages = ["src"]
 addopts = "--strict-config --strict-markers"
 testpaths = ["tests"]
 markers = [
-  "live_crdb: requires separately configured live CockroachDB connections",
-  "live_lambda: requires a separately deployed live AWS Lambda target",
-  "live_openai: requires separately configured live OpenAI access",
-  "live_ccloud: requires a separately configured live ccloud identity",
+  "live_crdb: separately authorized live CockroachDB test",
+  "live_openai: separately authorized live OpenAI test",
+  "live_ccloud: separately authorized live ccloud test",
+  "live_lambda: separately authorized live AWS Lambda test",
+  "preseed: Lambda test before public demo profiles are seeded",
   "phase_skeleton: applies only to the initial scaffold",
   "phase_implementation: applies after an implementation packet has merged",
 ]
