@@ -225,6 +225,36 @@ def _version(text: str) -> str:
     return f"v{match.group(1)}"
 
 
+CCLOUD_OUTPUT_HELP = re.compile(
+    r"^[ \t]*(?:-o,[ \t]+)?--output[ \t]+string[ \t]+"
+    r"output format[ \t]+\[standard\|json\]"
+    r'(?:[ \t]+\(default "standard"\))?[ \t]*$'
+)
+CCLOUD_OUTPUT_OPTION = re.compile(r"(?<![A-Za-z0-9_-])--output(?:[= \t]|$)")
+CCLOUD_COMPETING_JSON_OPTION = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:--format(?:[= \t]|$)|--json(?![A-Za-z0-9_-]))"
+)
+
+
+def _canonical_json_flag(help_text: str) -> str:
+    """Bind the one approved ccloud JSON mechanism from canonical help."""
+    output_lines = [
+        line for line in help_text.splitlines() if CCLOUD_OUTPUT_OPTION.search(line)
+    ]
+    competing = [
+        line
+        for line in help_text.splitlines()
+        if CCLOUD_COMPETING_JSON_OPTION.search(line)
+    ]
+    if (
+        len(output_lines) != 1
+        or CCLOUD_OUTPUT_HELP.fullmatch(output_lines[0]) is None
+        or competing
+    ):
+        _blocked("exactly one canonical ccloud JSON output option is required")
+    return "--output=json"
+
+
 def discover_preflight() -> dict[str, str]:
     """Bind the installed ccloud executable, version, help, and JSON flag."""
     executable = _regular_executable()
@@ -233,13 +263,7 @@ def discover_preflight() -> dict[str, str]:
     help_receipt = bounded_process(executable, ("cluster", "info", "--help"))
     version_text = _complete_text(version_receipt)
     help_text = _complete_text(help_receipt)
-    advertised = [
-        flag
-        for flag in ("--output=json", "--format=json", "--json")
-        if flag in help_text
-    ]
-    if len(advertised) != 1:
-        _blocked("exactly one ccloud JSON flag is required")
+    json_flag = _canonical_json_flag(help_text)
     return {
         "ccloud_executable": str(executable),
         "ccloud_executable_sha256": executable_digest,
@@ -248,7 +272,7 @@ def discover_preflight() -> dict[str, str]:
             version_receipt.stdout + version_receipt.stderr
         ),
         "ccloud_help_digest": sha256_bytes(help_receipt.stdout + help_receipt.stderr),
-        "ccloud_json_flag": advertised[0],
+        "ccloud_json_flag": json_flag,
     }
 
 
