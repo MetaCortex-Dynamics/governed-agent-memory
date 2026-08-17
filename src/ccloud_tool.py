@@ -24,9 +24,13 @@ import asyncpg  # type: ignore[import-untyped]
 
 MAX_OUTPUT_BYTES = 65_536
 COMMAND_TIMEOUT_SECONDS = 10.0
-CLUSTER_NAME = "governed-agent-memory"
-EXPECTED_VERSION = "v26.2.1"
+CLUSTER_NAME = "kingly-dreamer"
+REQUIRED_VERSION_FAMILY = "v26.2"
 EXPECTED_REGION = "us-east-1"
+CCLOUD_COMPAT_VERSION = "v0.6.12"
+CCAPI_COMPAT_VERSION = "2023-04-10"
+LEGACY_WIRE_PLAN = "SERVERLESS"
+SEMANTIC_PLAN = "BASIC"
 VERSION_ARTIFACT = Path("schema/crdb-version.json")
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 REGION = re.compile(r"^[a-z]{2}-[a-z]+-[0-9]$")
@@ -39,6 +43,28 @@ CONNECTION_STRING = re.compile(r"(?i)postgres(?:ql)?://[^\s]+")
 CREDENTIAL_FIELD = re.compile(
     r"(?i)^(?:access[_-]?key|authorization|credential|password|"
     r"private[_-]?key|secret|session[_-]?key|token)$"
+)
+CLUSTER_DOCUMENT_FIELDS = frozenset(
+    {
+        "account_id",
+        "cloud_provider",
+        "cockroach_version",
+        "config",
+        "created_at",
+        "creator_id",
+        "egress_traffic_policy",
+        "id",
+        "name",
+        "network_visibility",
+        "operation_status",
+        "parent_id",
+        "plan",
+        "regions",
+        "sql_dns",
+        "state",
+        "updated_at",
+        "upgrade_status",
+    }
 )
 
 
@@ -305,7 +331,7 @@ def _region_names(value: Any) -> list[str]:
     for item in value:
         if isinstance(item, str):
             name = item
-        elif isinstance(item, dict) and set(item) == {"name"}:
+        elif isinstance(item, dict) and isinstance(item.get("name"), str):
             name = item["name"]
         else:
             _blocked("cluster region entry is invalid")
@@ -324,28 +350,47 @@ def _field(document: Mapping[str, Any], *names: str) -> Any:
     return document[present[0]]
 
 
-def normalize_cluster_document(raw: bytes) -> tuple[dict[str, Any], list[str]]:
+def normalize_cluster_document(
+    raw: bytes,
+    *,
+    ccloud_version: str,
+    ccapi_version: str,
+) -> tuple[dict[str, Any], list[str]]:
     """Reduce ccloud output to the exact non-sensitive closure document."""
     value = strict_json(raw)
-    if not isinstance(value, dict):
-        _blocked("cluster output is not an object")
-    raw_id = _field(value, "id", "cluster_id", "clusterId")
-    name = _field(value, "name")
-    version = _field(value, "cockroach_version", "cockroachVersion", "version")
-    state = _field(value, "state")
-    plan = _field(value, "plan")
-    cloud = _field(value, "cloud", "provider", "cloud_provider")
-    regions = _region_names(_field(value, "regions"))
-    scalar_values = (raw_id, name, version, state, plan, cloud)
+    if isinstance(value, list):
+        if len(value) != 1 or not isinstance(value[0], dict):
+            _blocked("cluster output array is not exactly one object")
+        document = value[0]
+    elif isinstance(value, dict):
+        document = value
+    else:
+        _blocked("cluster output envelope is invalid")
+    if set(document) != CLUSTER_DOCUMENT_FIELDS:
+        _blocked("cluster output fields differ from the bound ccloud shape")
+    raw_id = _field(document, "id")
+    name = _field(document, "name")
+    version = _field(document, "cockroach_version")
+    state = _field(document, "state")
+    wire_plan = _field(document, "plan")
+    cloud = _field(document, "cloud_provider")
+    regions = _region_names(_field(document, "regions"))
+    scalar_values = (raw_id, name, version, state, wire_plan, cloud)
     if not all(isinstance(item, str) for item in scalar_values):
         _blocked("cluster output field type is invalid")
     version_normalized = _version(str(version))
+    semantic_plan = normalize_legacy_plan(
+        str(wire_plan),
+        ccloud_version=ccloud_version,
+        ccapi_version=ccapi_version,
+    )
     normalized = {
         "name": name,
         "cluster_id_digest": sha256_bytes(str(raw_id).encode()),
         "cockroach_version": version_normalized,
         "state": state,
-        "plan": plan,
+        "wire_plan": wire_plan,
+        "plan": semantic_plan,
         "cloud": cloud,
         "regions": regions,
     }
@@ -353,18 +398,47 @@ def normalize_cluster_document(raw: bytes) -> tuple[dict[str, Any], list[str]]:
     return normalized, manifest
 
 
+def normalize_legacy_plan(
+    wire_plan: str,
+    *,
+    ccloud_version: str,
+    ccapi_version: str,
+) -> str:
+    """Normalize only the explicitly bound legacy Serverless wire value."""
+    if wire_plan == SEMANTIC_PLAN:
+        return SEMANTIC_PLAN
+    if (
+        wire_plan == LEGACY_WIRE_PLAN
+        and ccloud_version == CCLOUD_COMPAT_VERSION
+        and ccapi_version == CCAPI_COMPAT_VERSION
+    ):
+        return SEMANTIC_PLAN
+    _blocked("ccloud plan compatibility binding mismatch")
+
+
 def _validate_target(document: Mapping[str, Any], artifact: Mapping[str, Any]) -> None:
     expected = {
         "name": CLUSTER_NAME,
         "cluster_id_digest": artifact["expected_cluster_id_digest"],
-        "cockroach_version": EXPECTED_VERSION,
+        "cockroach_version": artifact["observed_cockroach_version"],
         "state": "CREATED",
-        "plan": "Basic",
+        "wire_plan": artifact["target_wire_plan"],
+        "plan": artifact["target_plan"],
         "cloud": "AWS",
         "regions": [EXPECTED_REGION],
     }
     if document != expected:
         _blocked("ccloud target binding mismatch")
+    version = str(document["cockroach_version"])
+    if not version.startswith(f"{artifact['required_version_family']}."):
+        _blocked("ccloud target version family mismatch")
+    semantic_plan = normalize_legacy_plan(
+        str(document["wire_plan"]),
+        ccloud_version=str(artifact["ccloud_version"]),
+        ccapi_version=str(artifact["ccapi_version"]),
+    )
+    if semantic_plan != artifact["target_plan"]:
+        _blocked("ccloud target semantic plan mismatch")
 
 
 def _redaction_guard(value: Any) -> None:
@@ -448,7 +522,11 @@ def build_capture(artifact: Mapping[str, Any]) -> dict[str, Any]:
         _blocked("unbound ccloud JSON flag")
     arguments = ("cluster", "info", CLUSTER_NAME, str(flag))
     receipt = bounded_process(executable, arguments)
-    normalized, redactions = normalize_cluster_document(receipt.stdout)
+    normalized, redactions = normalize_cluster_document(
+        receipt.stdout,
+        ccloud_version=str(artifact["ccloud_version"]),
+        ccapi_version=str(artifact["ccapi_version"]),
+    )
     _validate_target(normalized, artifact)
     _redaction_guard(normalized)
     captured = datetime.now(UTC)

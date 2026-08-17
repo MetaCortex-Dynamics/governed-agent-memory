@@ -1,8 +1,9 @@
-"""Unit tests for deterministic ccloud help discovery."""
+"""Unit tests for deterministic ccloud discovery and target normalization."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,62 @@ OFFICIAL_HELP = (
     "Flags:\n"
     '  -o, --output string   output format [standard|json] (default "standard")\n'
 )
+SYNTHETIC_CLUSTER_ID = "synthetic-cluster-identifier"
+SYNTHETIC_CLUSTER_DIGEST = ccloud_tool.sha256_bytes(SYNTHETIC_CLUSTER_ID.encode())
+
+
+def observed_record(**changes: Any) -> dict[str, Any]:
+    """Return a wholly synthetic fixture with the observed official key shape."""
+    value: dict[str, Any] = {
+        "account_id": "synthetic-account",
+        "cloud_provider": "AWS",
+        "cockroach_version": "v26.2.5",
+        "config": {},
+        "created_at": "2000-01-01T00:00:00Z",
+        "creator_id": "synthetic-creator",
+        "egress_traffic_policy": "ALLOW_ALL",
+        "id": SYNTHETIC_CLUSTER_ID,
+        "name": "kingly-dreamer",
+        "network_visibility": "PUBLIC",
+        "operation_status": "COMPLETED",
+        "parent_id": "synthetic-parent",
+        "plan": "SERVERLESS",
+        "regions": [{"name": "us-east-1", "synthetic_extra": "ignored"}],
+        "sql_dns": "synthetic.invalid",
+        "state": "CREATED",
+        "updated_at": "2000-01-01T00:00:00Z",
+        "upgrade_status": "FINALIZED",
+    }
+    value.update(changes)
+    return value
+
+
+def normalize(value: object) -> dict[str, Any]:
+    normalized, _ = ccloud_tool.normalize_cluster_document(
+        ccloud_tool.canonical_bytes(value),
+        ccloud_version=ccloud_tool.CCLOUD_COMPAT_VERSION,
+        ccapi_version=ccloud_tool.CCAPI_COMPAT_VERSION,
+    )
+    return normalized
+
+
+def target_artifact(executable: Path, profile: str) -> dict[str, Any]:
+    return {
+        "ccloud_executable": str(executable),
+        "ccloud_executable_sha256": ccloud_tool.sha256_bytes(executable.read_bytes()),
+        "ccloud_version": ccloud_tool.CCLOUD_COMPAT_VERSION,
+        "ccapi_version": ccloud_tool.CCAPI_COMPAT_VERSION,
+        "ccloud_help_digest": "3" * 64,
+        "ccloud_config_digest": "4" * 64,
+        "ccloud_auth_profile_digest": ccloud_tool.sha256_bytes(profile.encode()),
+        "ccloud_json_flag": "--output=json",
+        "required_version_family": ccloud_tool.REQUIRED_VERSION_FAMILY,
+        "observed_cockroach_version": "v26.2.5",
+        "expected_cluster_id_digest": SYNTHETIC_CLUSTER_DIGEST,
+        "provisioning_receipt_digest": "2" * 64,
+        "target_wire_plan": "SERVERLESS",
+        "target_plan": "BASIC",
+    }
 
 
 def _receipt(argv: tuple[str, ...], stdout: str) -> ProcessReceipt:
@@ -55,7 +112,6 @@ def test_discover_preflight_binds_official_output_contract(
     tmp_path: Path,
 ) -> None:
     result = _discover(monkeypatch, tmp_path, OFFICIAL_HELP)
-
     assert result["ccloud_version"] == "v0.6.12"
     assert result["ccloud_json_flag"] == "--output=json"
 
@@ -112,45 +168,128 @@ def test_discover_preflight_rejects_ambiguous_or_malformed_output_help(
         _discover(monkeypatch, tmp_path, help_text)
 
 
-def test_capture_uses_bound_canonical_one_token_argv(
+@pytest.mark.parametrize("envelope", ["object", "one-element-array"])
+def test_observed_document_shape_and_exact_digest_are_normalized(envelope: str) -> None:
+    record = observed_record()
+    payload: object = record if envelope == "object" else [record]
+    result = normalize(payload)
+    assert result == {
+        "name": "kingly-dreamer",
+        "cluster_id_digest": SYNTHETIC_CLUSTER_DIGEST,
+        "cockroach_version": "v26.2.5",
+        "state": "CREATED",
+        "wire_plan": "SERVERLESS",
+        "plan": "BASIC",
+        "cloud": "AWS",
+        "regions": ["us-east-1"],
+    }
+
+
+@pytest.mark.parametrize(
+    "regions",
+    [
+        ["us-east-1"],
+        [{"name": "us-east-1"}],
+        [{"name": "us-east-1", "synthetic_extra": "ignored"}],
+    ],
+)
+def test_region_shapes_are_normalized(regions: object) -> None:
+    assert normalize(observed_record(regions=regions))["regions"] == ["us-east-1"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        [observed_record(), observed_record()],
+        {**observed_record(), "unknown_field": "rejected"},
+        observed_record(regions=[]),
+        observed_record(regions=[{"region": "us-east-1"}]),
+    ],
+)
+def test_unknown_ambiguous_or_malformed_shapes_are_rejected(value: object) -> None:
+    with pytest.raises(EvidenceBlocked):
+        normalize(value)
+
+
+def test_serverless_normalizes_only_in_bound_compatibility_domain() -> None:
+    assert (
+        ccloud_tool.normalize_legacy_plan(
+            "SERVERLESS",
+            ccloud_version="v0.6.12",
+            ccapi_version="2023-04-10",
+        )
+        == "BASIC"
+    )
+    for versions in (("v0.6.13", "2023-04-10"), ("v0.6.12", "2024-01-01")):
+        with pytest.raises(EvidenceBlocked, match="compatibility binding"):
+            ccloud_tool.normalize_legacy_plan(
+                "SERVERLESS",
+                ccloud_version=versions[0],
+                ccapi_version=versions[1],
+            )
+
+
+def base_target_artifact() -> dict[str, object]:
+    return {
+        "expected_cluster_id_digest": SYNTHETIC_CLUSTER_DIGEST,
+        "required_version_family": "v26.2",
+        "observed_cockroach_version": "v26.2.5",
+        "target_wire_plan": "SERVERLESS",
+        "target_plan": "BASIC",
+        "ccloud_version": "v0.6.12",
+        "ccapi_version": "2023-04-10",
+    }
+
+
+def test_v26_2_patch_is_preserved_and_outside_family_is_rejected() -> None:
+    document = normalize(observed_record(cockroach_version="v26.2.5"))
+    artifact = base_target_artifact()
+    ccloud_tool._validate_target(document, artifact)
+    assert document["cockroach_version"] == "v26.2.5"
+    outside = normalize(observed_record(cockroach_version="v26.3.0"))
+    artifact["observed_cockroach_version"] = "v26.3.0"
+    with pytest.raises(EvidenceBlocked, match="version family"):
+        ccloud_tool._validate_target(outside, artifact)
+
+
+@pytest.mark.parametrize(
+    "record_change,artifact_change",
+    [
+        ({"name": "wrong-name"}, {}),
+        ({"id": "wrong-id"}, {}),
+        ({"cloud_provider": "GCP"}, {}),
+        ({"regions": ["us-west-2"]}, {}),
+        ({"state": "UPDATING"}, {}),
+    ],
+)
+def test_every_mismatched_target_field_is_rejected(
+    record_change: dict[str, object], artifact_change: dict[str, object]
+) -> None:
+    document = normalize(observed_record(**record_change))
+    artifact = base_target_artifact()
+    artifact.update(artifact_change)
+    with pytest.raises(EvidenceBlocked):
+        ccloud_tool._validate_target(document, artifact)
+
+
+def test_capture_uses_bound_canonical_argv_and_preserves_both_plans(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     executable = tmp_path / "ccloud"
     executable.write_bytes(b"official-ccloud-0.6.12")
     profile = "local-test-profile"
-    expected_id = ccloud_tool.sha256_bytes(b"cluster-id")
-    receipt_digest = "2" * 64
-    artifact = {
-        "ccloud_executable": str(executable),
-        "ccloud_executable_sha256": ccloud_tool.sha256_bytes(executable.read_bytes()),
-        "ccloud_version": "v0.6.12",
-        "ccloud_help_digest": "3" * 64,
-        "ccloud_config_digest": "4" * 64,
-        "ccloud_auth_profile_digest": ccloud_tool.sha256_bytes(profile.encode()),
-        "ccloud_json_flag": "--output=json",
-        "expected_cluster_id_digest": expected_id,
-        "provisioning_receipt_digest": receipt_digest,
-    }
+    artifact = target_artifact(executable, profile)
     monkeypatch.setenv("CCLOUD_CLUSTER_NAME", ccloud_tool.CLUSTER_NAME)
     monkeypatch.setenv("CCLOUD_AUTH_PROFILE", profile)
-    monkeypatch.setenv("CCLOUD_EXPECTED_CLUSTER_ID_DIGEST", expected_id)
-    monkeypatch.setenv("CCLOUD_PROVISIONING_RECEIPT_DIGEST", receipt_digest)
+    monkeypatch.setenv("CCLOUD_EXPECTED_CLUSTER_ID_DIGEST", SYNTHETIC_CLUSTER_DIGEST)
+    monkeypatch.setenv("CCLOUD_PROVISIONING_RECEIPT_DIGEST", "2" * 64)
     observed_arguments: list[tuple[str, ...]] = []
 
     def fake_process(path: Path, arguments: tuple[str, ...]) -> ProcessReceipt:
-        assert path == executable
         observed_arguments.append(arguments)
-        payload = {
-            "id": "cluster-id",
-            "name": ccloud_tool.CLUSTER_NAME,
-            "version": ccloud_tool.EXPECTED_VERSION,
-            "state": "CREATED",
-            "plan": "Basic",
-            "cloud": "AWS",
-            "regions": [{"name": ccloud_tool.EXPECTED_REGION}],
-        }
-        raw = ccloud_tool.canonical_bytes(payload)
+        raw = ccloud_tool.canonical_bytes([observed_record()])
         return ProcessReceipt(
             argv=(str(path), *arguments),
             stdout=raw,
@@ -161,8 +300,9 @@ def test_capture_uses_bound_canonical_one_token_argv(
 
     monkeypatch.setattr(ccloud_tool, "bounded_process", fake_process)
     result = ccloud_tool.build_capture(artifact)
-
     assert observed_arguments == [
-        ("cluster", "info", ccloud_tool.CLUSTER_NAME, "--output=json")
+        ("cluster", "info", "kingly-dreamer", "--output=json")
     ]
     assert result["redacted_command_argv"][-1] == "--output=json"
+    assert result["normalized_redacted_output"]["wire_plan"] == "SERVERLESS"
+    assert result["normalized_redacted_output"]["plan"] == "BASIC"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -60,6 +61,12 @@ class MemoryConflictError(MemoryIntegrityError):
     """An idempotency key or lineage binding names different bytes."""
 
 
+CCLOUD_CLUSTER_NAME = "kingly-dreamer"
+CCLOUD_CLUSTER_NAME_DIGEST = hashlib.sha256(
+    CCLOUD_CLUSTER_NAME.encode("utf-8")
+).hexdigest()
+
+
 class _Transaction(Protocol):
     async def __aenter__(self) -> object: ...
 
@@ -112,6 +119,11 @@ def _plain_json(value: object) -> str:
         allow_nan=False,
         separators=(",", ":"),
     )
+
+
+def _json_sha256(value: object) -> str:
+    """Hash the canonical plain-JSON domain used by external tool evidence."""
+    return hashlib.sha256(_plain_json(value).encode("utf-8")).hexdigest()
 
 
 def _loaded(value: object) -> Any:
@@ -507,7 +519,8 @@ def _validate_dependency_fact(fact: DependencyFact) -> None:
 def _validate_tool_evidence(evidence: ToolEvidence) -> None:
     if (
         evidence.tool_name != "ccloud"
-        or evidence.cluster_name != "governed-agent-memory"
+        or evidence.cluster_name != CCLOUD_CLUSTER_NAME
+        or evidence.cluster_name_digest != CCLOUD_CLUSTER_NAME_DIGEST
         or evidence.exit_status != 0
         or evidence.evidence_digest != _tool_evidence_digest(evidence)
     ):
@@ -515,7 +528,7 @@ def _validate_tool_evidence(evidence: ToolEvidence) -> None:
 
 
 def _tool_evidence_digest(evidence: ToolEvidence) -> str:
-    return canonical_sha256(
+    return _json_sha256(
         {
             "schema": "gam.tool-evidence.v1",
             "tool_name": evidence.tool_name,
@@ -1234,7 +1247,7 @@ INSERT INTO tool_evidence (
     async def get_latest_unexpired_tool_evidence(
         self, cluster_name: str
     ) -> ToolEvidence:
-        if cluster_name != "governed-agent-memory":
+        if cluster_name != CCLOUD_CLUSTER_NAME:
             raise MemoryIntegrityError("tool evidence cluster is not permitted")
 
         async def operation(connection: Connection) -> ToolEvidence:

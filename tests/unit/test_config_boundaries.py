@@ -37,11 +37,12 @@ def artifact_fixture(tmp_path: Path) -> tuple[Path, str]:
     profile = "unit-profile-label"
     value: dict[str, object] = {
         "artifact_version": "gam.crdb-version.v1",
-        "cockroach_version": "v26.2.1",
+        "required_version_family": "v26.2",
+        "observed_cockroach_version": "v26.2.5",
         "cockroach_version_raw_digest": "1" * 64,
         "feature_vector_index_enabled": True,
         "database_name": "governed_agent_memory",
-        "cluster_name_digest": digest(b"governed-agent-memory"),
+        "cluster_name_digest": digest(b"kingly-dreamer"),
         "expected_cluster_id_digest": "2" * 64,
         "provisioning_receipt_digest": "3" * 64,
         "preprovision_record_sha256": "4" * 64,
@@ -49,8 +50,9 @@ def artifact_fixture(tmp_path: Path) -> tuple[Path, str]:
         "preprovision_observed_at": "2026-08-16T12:00:00.000000Z",
         "setup_promotion_digest": "6" * 64,
         "schema_admin_handle_digest": "7" * 64,
-        "target_state": "READY",
-        "target_plan": "Basic",
+        "target_state": "CREATED",
+        "target_wire_plan": "SERVERLESS",
+        "target_plan": "BASIC",
         "target_cloud": "AWS",
         "target_regions": ["us-east-1"],
         "target_spend_limit_usd": "0",
@@ -58,11 +60,12 @@ def artifact_fixture(tmp_path: Path) -> tuple[Path, str]:
         "ccloud_executable": str(executable.resolve()),
         "ccloud_executable_sha256": digest(executable.read_bytes()),
         "ccloud_version": "v0.6.12",
+        "ccapi_version": "2023-04-10",
         "ccloud_version_raw_digest": "8" * 64,
         "ccloud_help_digest": "9" * 64,
         "ccloud_config_digest": "a" * 64,
         "ccloud_auth_profile_digest": digest(profile.encode()),
-        "ccloud_json_flag": "--json",
+        "ccloud_json_flag": "--output=json",
     }
     value["capture_digest"] = digest(canonical(value))
     path = tmp_path / "crdb-version.json"
@@ -139,7 +142,7 @@ def test_bound_crdb_artifact_and_ccloud_environment_are_exact(
         "DATABASE_URL_APP",
         "postgresql://gam_app@db.example/app?sslmode=verify-full",
     )
-    monkeypatch.setenv("CCLOUD_CLUSTER_NAME", "governed-agent-memory")
+    monkeypatch.setenv("CCLOUD_CLUSTER_NAME", "kingly-dreamer")
     monkeypatch.setenv("CCLOUD_AUTH_PROFILE", profile)
     monkeypatch.setenv("CCLOUD_EXPECTED_CLUSTER_ID_DIGEST", "2" * 64)
     monkeypatch.setenv("CCLOUD_PROVISIONING_RECEIPT_DIGEST", "3" * 64)
@@ -147,9 +150,12 @@ def test_bound_crdb_artifact_and_ccloud_environment_are_exact(
     assert isinstance(config.bound_version, BoundCrdbVersion)
     assert profile not in repr(config)
     assert "postgresql://" not in repr(config)
-    assert config.bound_version.cockroach_version == "v26.2.1"
+    assert config.bound_version.required_version_family == "v26.2"
+    assert config.bound_version.observed_cockroach_version == "v26.2.5"
     assert config.bound_version.ccloud_version == "v0.6.12"
-    assert config.bound_version.ccloud_version != config.bound_version.cockroach_version
+    assert config.bound_version.ccloud_version != (
+        config.bound_version.observed_cockroach_version
+    )
 
 
 def test_preflight_writer_round_trips_exactly_through_bound_loader(
@@ -165,7 +171,8 @@ def test_preflight_writer_round_trips_exactly_through_bound_loader(
     assert output.read_bytes() == canonical(value)
     assert not output.read_bytes().endswith(b"\n")
     loaded = BoundCrdbVersion.load(output)
-    assert loaded.cockroach_version == "v26.2.1"
+    assert loaded.required_version_family == "v26.2"
+    assert loaded.observed_cockroach_version == "v26.2.5"
     assert loaded.ccloud_version == "v0.6.12"
 
 
@@ -173,8 +180,10 @@ def test_preflight_writer_round_trips_exactly_through_bound_loader(
     ("mutation", "message"),
     [
         ({"target_cloud": "GCP"}, "target_cloud"),
-        ({"ccloud_version": "v26.2.1"}, "version domain"),
-        ({"ccloud_version": "0.6.12"}, "version domain"),
+        ({"ccloud_version": "v26.2.1"}, "ccloud_version"),
+        ({"ccloud_version": "0.6.12"}, "ccloud_version"),
+        ({"observed_cockroach_version": "v26.3.0"}, "version family"),
+        ({"target_wire_plan": "BASIC"}, "target_wire_plan"),
         ({"expected_cluster_id_digest": "f" * 64}, "capture digest"),
         ({"capture_digest": "f" * 64}, "capture digest"),
         ({"extra": "value"}, "fields differ"),

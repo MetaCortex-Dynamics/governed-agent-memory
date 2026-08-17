@@ -553,8 +553,8 @@ CREATE TABLE tool_evidence (
     command_digest STRING(64) NOT NULL,
     help_digest STRING(64) NOT NULL,
     config_digest STRING(64) NOT NULL,
-    cluster_name STRING NOT NULL DEFAULT 'governed-agent-memory'
-        CHECK (cluster_name = 'governed-agent-memory'),
+    cluster_name STRING NOT NULL DEFAULT 'kingly-dreamer'
+        CHECK (cluster_name = 'kingly-dreamer'),
     cluster_name_digest STRING(64) NOT NULL,
     observed_cluster_id_digest STRING(64) NOT NULL,
     observed_version STRING NOT NULL,

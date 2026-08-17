@@ -31,9 +31,11 @@ _FORBIDDEN_APP_USERS = frozenset(
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
-_CLUSTER_NAME = "governed-agent-memory"
+_CLUSTER_NAME = "kingly-dreamer"
 _DATABASE_NAME = "governed_agent_memory"
-_COCKROACH_VERSION = "v26.2.1"
+_REQUIRED_VERSION_FAMILY = "v26.2"
+_CCLOUD_VERSION = "v0.6.12"
+_CCAPI_VERSION = "2023-04-10"
 _VECTOR_DOCS_URL = "https://www.cockroachlabs.com/docs/v26.2/vector-indexes"
 _EMBEDDING_MODEL = "text-embedding-3-small"
 _EMBEDDING_DIMENSIONS = 1536
@@ -132,7 +134,8 @@ class EmbeddingConfig:
 @dataclass(frozen=True, slots=True)
 class BoundCrdbVersion:
     artifact_version: str
-    cockroach_version: str
+    required_version_family: str
+    observed_cockroach_version: str
     cockroach_version_raw_digest: str
     feature_vector_index_enabled: bool
     database_name: str
@@ -145,6 +148,7 @@ class BoundCrdbVersion:
     setup_promotion_digest: str
     schema_admin_handle_digest: str
     target_state: str
+    target_wire_plan: str
     target_plan: str
     target_cloud: str
     target_regions: tuple[str, ...]
@@ -153,6 +157,7 @@ class BoundCrdbVersion:
     ccloud_executable: str
     ccloud_executable_sha256: str
     ccloud_version: str
+    ccapi_version: str
     ccloud_version_raw_digest: str
     ccloud_help_digest: str
     ccloud_config_digest: str
@@ -171,15 +176,18 @@ class BoundCrdbVersion:
     def __post_init__(self) -> None:
         literal = {
             "artifact_version": "gam.crdb-version.v1",
-            "cockroach_version": _COCKROACH_VERSION,
+            "required_version_family": _REQUIRED_VERSION_FAMILY,
             "feature_vector_index_enabled": True,
             "database_name": _DATABASE_NAME,
-            "target_state": "READY",
-            "target_plan": "Basic",
+            "target_state": "CREATED",
+            "target_wire_plan": "SERVERLESS",
+            "target_plan": "BASIC",
             "target_cloud": "AWS",
             "target_regions": ("us-east-1",),
             "target_spend_limit_usd": "0",
             "vector_docs_url": _VECTOR_DOCS_URL,
+            "ccloud_version": _CCLOUD_VERSION,
+            "ccapi_version": _CCAPI_VERSION,
         }
         for name, expected in literal.items():
             if getattr(self, name) != expected:
@@ -202,12 +210,15 @@ class BoundCrdbVersion:
             _require_digest(cast(str, getattr(self, name)), name)
         if self.cluster_name_digest != _digest(_CLUSTER_NAME.encode("utf-8")):
             raise ConfigError("bound cluster-name digest mismatch")
-        if (
-            _VERSION.fullmatch(self.ccloud_version) is None
-            or self.ccloud_version == self.cockroach_version
+        if _VERSION.fullmatch(self.observed_cockroach_version) is None or not (
+            self.observed_cockroach_version.startswith(
+                f"{self.required_version_family}."
+            )
         ):
+            raise ConfigError("bound CockroachDB version family is invalid")
+        if _VERSION.fullmatch(self.ccloud_version) is None:
             raise ConfigError("bound ccloud version domain is invalid")
-        if self.ccloud_json_flag not in {"--output=json", "--format=json", "--json"}:
+        if self.ccloud_json_flag != "--output=json":
             raise ConfigError("bound ccloud JSON flag is invalid")
         executable = Path(self.ccloud_executable)
         try:

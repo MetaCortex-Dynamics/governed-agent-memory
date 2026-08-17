@@ -3,25 +3,36 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from src.memory import AppMemory, MemoryConflictError, MemoryIntegrityError
+from src.memory import (
+    CCLOUD_CLUSTER_NAME,
+    AppMemory,
+    MemoryConflictError,
+    MemoryIntegrityError,
+    _tool_evidence_digest,
+    _validate_tool_evidence,
+)
 from src.models import (
     CheckResult,
     ConsequenceReport,
     ExecutionStatus,
     PriorEvaluationTrace,
+    ToolEvidence,
 )
 from src.traces import canonical_sha256, snapshot_digest
 
 fixtures: Any = importlib.import_module("tests.unit.test_governance_rules")
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class SerializationFailure(RuntimeError):
@@ -274,6 +285,88 @@ def redigest_report(report: ConsequenceReport) -> ConsequenceReport:
         }
     )
     return replace(report, report_digest=digest)
+
+
+def tool_evidence(
+    *,
+    cluster_name: str = "kingly-dreamer",
+    cluster_name_digest: str | None = None,
+) -> ToolEvidence:
+    name_digest = (
+        cluster_name_digest or hashlib.sha256(cluster_name.encode()).hexdigest()
+    )
+    provisional = ToolEvidence(
+        evidence_id="00000000-0000-0000-0000-000000000001",
+        tool_name="ccloud",
+        tool_version="v0.6.12",
+        redacted_command_argv_json='["ccloud","cluster","info"]',
+        command_digest="1" * 64,
+        help_digest="2" * 64,
+        config_digest="3" * 64,
+        cluster_name=cluster_name,
+        cluster_name_digest=name_digest,
+        observed_cluster_id_digest="4" * 64,
+        observed_version="v26.2.5",
+        observed_state="CREATED",
+        observed_plan="BASIC",
+        observed_cloud="AWS",
+        normalized_redacted_output_json='{"name":"kingly-dreamer"}',
+        redaction_manifest_json='["cluster_id"]',
+        raw_output_digest="5" * 64,
+        normalized_output_digest="6" * 64,
+        exit_status=0,
+        captured_at="2026-08-17T00:00:00.000000Z",
+        expires_at="2026-08-17T00:15:00.000000Z",
+        captured_by="ccloud-evidence-adapter",
+        evidence_digest="0" * 64,
+        idempotency_key="tool-evidence-key",
+    )
+    return replace(
+        provisional,
+        evidence_digest=_tool_evidence_digest(provisional),
+    )
+
+
+def test_tool_evidence_schema_binds_observed_cluster_name() -> None:
+    schema = (ROOT / "schema/init.sql").read_text(encoding="utf-8")
+    assert "cluster_name STRING NOT NULL DEFAULT 'kingly-dreamer'" in schema
+    assert "CHECK (cluster_name = 'kingly-dreamer')" in schema
+    assert "CHECK (cluster_name = 'governed-agent-memory')" not in schema
+
+
+def test_tool_evidence_accepts_exact_name_and_digest() -> None:
+    _validate_tool_evidence(tool_evidence())
+
+
+@pytest.mark.parametrize("cluster_name", ["governed-agent-memory", "other-cluster"])
+def test_tool_evidence_rejects_obsolete_or_arbitrary_cluster_name(
+    cluster_name: str,
+) -> None:
+    name_digest = hashlib.sha256(cluster_name.encode()).hexdigest()
+    with pytest.raises(MemoryIntegrityError, match="tool evidence binding"):
+        _validate_tool_evidence(
+            tool_evidence(
+                cluster_name=cluster_name,
+                cluster_name_digest=name_digest,
+            )
+        )
+
+
+def test_tool_evidence_rejects_correct_name_with_wrong_name_digest() -> None:
+    evidence = tool_evidence(cluster_name_digest="f" * 64)
+    with pytest.raises(MemoryIntegrityError, match="tool evidence binding"):
+        _validate_tool_evidence(evidence)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cluster_name", ["governed-agent-memory", "other-cluster"])
+async def test_latest_tool_evidence_lookup_rejects_incorrect_name(
+    cluster_name: str,
+) -> None:
+    memory, _, _, _ = memory_fixture()
+    with pytest.raises(MemoryIntegrityError, match="not permitted"):
+        await memory.get_latest_unexpired_tool_evidence(cluster_name)
+    assert cluster_name != CCLOUD_CLUSTER_NAME
 
 
 @pytest.mark.asyncio

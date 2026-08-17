@@ -16,13 +16,15 @@ from typing import Any, NoReturn
 import asyncpg  # type: ignore[import-untyped]
 
 from src.ccloud_tool import (
+    CCAPI_COMPAT_VERSION,
     CLUSTER_NAME,
     EXPECTED_REGION,
-    EXPECTED_VERSION,
+    REQUIRED_VERSION_FAMILY,
     EvidenceBlocked,
     canonical_bytes,
     canonical_digest,
     discover_preflight,
+    normalize_legacy_plan,
     sha256_bytes,
     strict_json,
 )
@@ -31,7 +33,7 @@ VERSION_ARTIFACT = Path("schema/crdb-version.json")
 DATABASE_NAME = "governed_agent_memory"
 VECTOR_DOCS_URL = "https://www.cockroachlabs.com/docs/v26.2/vector-indexes"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
-RELEASE = re.compile(r"(?<![0-9])v?(26\.2\.1)(?![0-9])")
+RELEASE = re.compile(r"(?<![0-9])v?(26\.2\.(?:0|[1-9][0-9]*))(?![0-9])")
 TABLES = (
     "consequence_reports",
     "decisions",
@@ -155,15 +157,17 @@ def load_preprovision() -> tuple[dict[str, Any], bytes]:
         "cloud": "AWS",
         "cluster_name": CLUSTER_NAME,
         "cluster_name_digest": sha256_bytes(CLUSTER_NAME.encode()),
-        "cockroach_version": EXPECTED_VERSION,
-        "plan": "Basic",
+        "plan": "SERVERLESS",
         "regions": [EXPECTED_REGION],
         "spend_limit_usd": "0",
-        "state": "READY",
+        "state": "CREATED",
     }
     for key, expected in literal_expected.items():
         if value[key] != expected:
             blocked(f"preprovision target mismatch: {key}")
+    observed_version = str(value["cockroach_version"])
+    if not observed_version.startswith(f"{REQUIRED_VERSION_FAMILY}."):
+        blocked("preprovision target mismatch: cockroach_version")
     for key in (
         "admin_handle_digest",
         "cluster_id_digest",
@@ -213,14 +217,16 @@ async def server_preflight(url: str) -> dict[str, Any]:
         )
     finally:
         await connection.close()
-    if normalize_release(version_raw) != EXPECTED_VERSION:
-        blocked("server release mismatch")
+    observed_version = normalize_release(version_raw)
+    if not observed_version.startswith(f"{REQUIRED_VERSION_FAMILY}."):
+        blocked("server release family mismatch")
     if str(setting).lower() != "true":
         blocked("vector indexing is disabled")
     if collision != 0:
         blocked("target database already exists")
     return {
-        "cockroach_version": EXPECTED_VERSION,
+        "required_version_family": REQUIRED_VERSION_FAMILY,
+        "observed_cockroach_version": observed_version,
         "cockroach_version_raw_digest": sha256_bytes(version_raw.encode()),
         "feature_vector_index_enabled": True,
     }
@@ -250,10 +256,17 @@ def preflight_config(
         "schema_admin_handle_digest": record["admin_handle_digest"],
         "preprovision_observed_at": record["captured_at"],
         "target_state": record["state"],
-        "target_plan": record["plan"],
+        "target_wire_plan": record["plan"],
+        "target_plan": normalize_legacy_plan(
+            str(record["plan"]),
+            ccloud_version=tool["ccloud_version"],
+            ccapi_version=CCAPI_COMPAT_VERSION,
+        ),
         "target_cloud": record["cloud"],
         "target_regions": record["regions"],
-        "cockroach_version": record["cockroach_version"],
+        "required_version_family": REQUIRED_VERSION_FAMILY,
+        "observed_cockroach_version": record["cockroach_version"],
+        "ccapi_version": CCAPI_COMPAT_VERSION,
         "target_spend_limit_usd": record["spend_limit_usd"],
     }
 
@@ -281,6 +294,8 @@ async def preflight() -> None:
     record, raw = load_preprovision()
     tool = discover_preflight()
     server = await server_preflight(database_url("DATABASE_URL_SCHEMA_ADMIN"))
+    if server["observed_cockroach_version"] != record["cockroach_version"]:
+        blocked("observed CockroachDB release differs from preprovision evidence")
     raw_digest = sha256_bytes(raw)
     config = preflight_config(record, raw_digest, tool)
     artifact: dict[str, Any] = {
@@ -296,7 +311,12 @@ async def preflight() -> None:
         "setup_promotion_digest": record["promotion_digest"],
         "schema_admin_handle_digest": record["admin_handle_digest"],
         "target_state": record["state"],
-        "target_plan": record["plan"],
+        "target_wire_plan": record["plan"],
+        "target_plan": normalize_legacy_plan(
+            str(record["plan"]),
+            ccloud_version=tool["ccloud_version"],
+            ccapi_version=CCAPI_COMPAT_VERSION,
+        ),
         "target_cloud": record["cloud"],
         "target_regions": record["regions"],
         "target_spend_limit_usd": record["spend_limit_usd"],
@@ -304,6 +324,7 @@ async def preflight() -> None:
         "ccloud_executable": tool["ccloud_executable"],
         "ccloud_executable_sha256": tool["ccloud_executable_sha256"],
         "ccloud_version": tool["ccloud_version"],
+        "ccapi_version": CCAPI_COMPAT_VERSION,
         "ccloud_version_raw_digest": tool["ccloud_version_raw_digest"],
         "ccloud_help_digest": tool["ccloud_help_digest"],
         "ccloud_config_digest": canonical_digest(config),
