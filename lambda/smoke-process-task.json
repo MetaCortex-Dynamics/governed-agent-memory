@@ -1,0 +1,1 @@
+{"agent_id":"lambda-smoke-agent","operation":"process_task","request_id":"6b71eae4-6f07-55a7-a691-ec0a40267790","requester_ref":"lambda-smoke-operator","schema_version":"gam.lambda.v1","session_id":"lambda-smoke-session","task_description":"Propose setting demo key lambda_smoke to the scalar string ready. Do not decide or execute it."}

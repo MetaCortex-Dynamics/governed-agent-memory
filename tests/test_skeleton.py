@@ -88,9 +88,14 @@ def test_entry_point(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out == "governed-agent-memory: scaffold only\n"
 
 
-def test_lambda_refuses() -> None:
-    """The scaffold Lambda cannot claim an implementation."""
+def test_lambda_phase_contract() -> None:
+    """The scaffold refuses; the Lambda phase fails closed on bad input."""
     handler = importlib.import_module("lambda.handler")
+    if (ROOT / "lambda/requirements.txt").is_file():
+        response = handler.lambda_handler({}, None)
+        assert response["statusCode"] == 400
+        assert json.loads(str(response["body"]))["error"] == "INVALID_ENVELOPE"
+        return
     with pytest.raises(
         RuntimeError, match="^AWS Lambda is not implemented in this scaffold$"
     ):
