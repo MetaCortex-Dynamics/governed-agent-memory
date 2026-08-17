@@ -1,11 +1,13 @@
-"""Scaffold command entry point."""
+"""Human command entry point with import-only scaffold compatibility."""
+
+from src.cli import main as cli_main
 
 
 def main() -> int:
-    """Report scaffold state without claiming product capability."""
+    """Preserve the initial import-only skeleton probe."""
     print("governed-agent-memory: scaffold only")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())
