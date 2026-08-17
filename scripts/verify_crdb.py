@@ -205,11 +205,7 @@ async def server_preflight(url: str) -> dict[str, Any]:
     try:
         version_raw = str(await connection.fetchval("SELECT version()"))
         setting = await connection.fetchval(
-            """
-            SELECT value
-              FROM crdb_internal.cluster_settings
-             WHERE variable = 'feature.vector_index.enabled'
-            """
+            "SHOW CLUSTER SETTING feature.vector_index.enabled"
         )
         collision = await connection.fetchval(
             "SELECT count(*) FROM [SHOW DATABASES] WHERE database_name=$1",
@@ -220,7 +216,7 @@ async def server_preflight(url: str) -> dict[str, Any]:
     observed_version = normalize_release(version_raw)
     if not observed_version.startswith(f"{REQUIRED_VERSION_FAMILY}."):
         blocked("server release family mismatch")
-    if str(setting).lower() != "true":
+    if not isinstance(setting, str) or setting.strip().casefold() != "true":
         blocked("vector indexing is disabled")
     if collision != 0:
         blocked("target database already exists")
