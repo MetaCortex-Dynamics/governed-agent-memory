@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import shutil
 import subprocess  # nosec B404
 from pathlib import Path
@@ -44,6 +46,15 @@ DEFAULTDB_URL = database_url("defaultdb", "application_name=unit&sslmode=verify-
 COLLISION_QUERY = (
     "SELECT count(*) AS database_count FROM [SHOW DATABASES] "
     "WHERE database_name = 'governed_agent_memory'"
+)
+ROLE_NAMES = (
+    "gam_reader_role",
+    "gam_app_role",
+    "gam_decider_role",
+    "gam_executor_role",
+)
+GRANT_CONTRACT_SHA256 = (
+    "0386e75e4016b6a20b836f9ebd1a5276dcdcc0120af25104b5b90a65016dfdde"
 )
 
 
@@ -154,6 +165,42 @@ def expected_calls() -> list[list[str]]:
             str(ROOT / "schema/roles.sql"),
         ],
     ]
+
+
+def role_declarations() -> list[str]:
+    """Return only role declarations from the deployment SQL."""
+    return [
+        line
+        for line in (ROOT / "schema/roles.sql").read_text().splitlines()
+        if line.startswith("CREATE ROLE ")
+    ]
+
+
+def test_role_declarations_use_exact_idempotent_nologin_syntax() -> None:
+    expected = [
+        f"CREATE ROLE IF NOT EXISTS {name} WITH NOLOGIN;" for name in ROLE_NAMES
+    ]
+
+    assert role_declarations() == expected
+    assert all(" IF NOT EXISTS " in statement for statement in expected)
+
+
+def test_role_declarations_create_no_login_or_credential() -> None:
+    declarations = "\n".join(role_declarations())
+
+    assert re.search(r"\bLOGIN\b", declarations) is None
+    assert "CREATE USER" not in declarations
+    assert "PASSWORD" not in declarations
+    assert "CREDENTIAL" not in declarations
+
+
+def test_existing_grant_contract_is_unchanged() -> None:
+    sql = (ROOT / "schema/roles.sql").read_text()
+    declarations, grants = sql.split("\n\n", 1)
+
+    assert declarations.splitlines() == role_declarations()
+    assert grants.startswith("REVOKE CREATE ON SCHEMA public FROM public;\n")
+    assert hashlib.sha256(grants.encode()).hexdigest() == GRANT_CONTRACT_SHA256
 
 
 def test_deploy_uses_exact_order_and_discloses_no_credentials(tmp_path: Path) -> None:

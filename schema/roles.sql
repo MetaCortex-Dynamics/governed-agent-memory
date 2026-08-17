@@ -1,7 +1,7 @@
-CREATE ROLE IF NOT EXISTS gam_reader_role NOLOGIN;
-CREATE ROLE IF NOT EXISTS gam_app_role NOLOGIN;
-CREATE ROLE IF NOT EXISTS gam_decider_role NOLOGIN;
-CREATE ROLE IF NOT EXISTS gam_executor_role NOLOGIN;
+CREATE ROLE IF NOT EXISTS gam_reader_role WITH NOLOGIN;
+CREATE ROLE IF NOT EXISTS gam_app_role WITH NOLOGIN;
+CREATE ROLE IF NOT EXISTS gam_decider_role WITH NOLOGIN;
+CREATE ROLE IF NOT EXISTS gam_executor_role WITH NOLOGIN;
 
 REVOKE CREATE ON SCHEMA public FROM public;
 REVOKE ALL ON TABLE proposals, gate_evaluations, decisions, dependency_facts, demo_kv,
