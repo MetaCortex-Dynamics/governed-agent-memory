@@ -354,9 +354,7 @@ async def schema_check() -> None:
              ORDER BY table_name
             """
         )
-        indexes = await connection.fetch(
-            "SELECT table_name, index_name FROM [SHOW INDEXES] ORDER BY 1, 2"
-        )
+        indexes = await connection.fetch("SHOW INDEX FROM proposals")
     finally:
         await connection.close()
     if current != DATABASE_NAME:
