@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import runpy
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,10 @@ ROLE_OPTIONS_STATEMENT = """
              ORDER BY username
             """
 LEGACY_ROLE_COLUMNS = ('"isRole"', '"canLogin"', '"createDB"', '"createRole"')
+SIMILARITY_QUERY = (
+    "SELECT id, embedding <=> $1::VECTOR AS distance "
+    "FROM proposals ORDER BY embedding <=> $1::VECTOR LIMIT 5"
+)
 
 
 class DatabaseFailure(RuntimeError):
@@ -133,6 +138,52 @@ class FakeGrantsConnection:
         self.closed = True
 
 
+class FakeVectorConnection:
+    """Record vector verification without opening a database connection."""
+
+    def __init__(
+        self,
+        plan: str,
+        *,
+        metadata_index_present: bool = True,
+    ) -> None:
+        self.plan = plan
+        self.metadata_index_present = metadata_index_present
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.parameter: object = None
+        self.closed = False
+
+    async def fetchval(self, statement: str) -> str:
+        self.calls.append((statement, ()))
+        if statement != "SHOW CREATE TABLE proposals":
+            raise AssertionError(f"unexpected fetchval statement: {statement!r}")
+        suffix = " idx_proposals_embedding" if self.metadata_index_present else ""
+        return "CREATE TABLE proposals" + suffix
+
+    async def fetch(
+        self, statement: str, *args: object
+    ) -> list[dict[str, str] | tuple[str]]:
+        self.calls.append((statement, args))
+        if statement == INDEX_STATEMENT:
+            if not self.metadata_index_present:
+                return []
+            return [
+                {
+                    "table_name": "proposals",
+                    "index_name": "idx_proposals_embedding",
+                }
+            ]
+        if statement == "EXPLAIN " + SIMILARITY_QUERY:
+            if len(args) != 1 or not isinstance(args[0], str):
+                raise AssertionError("VECTOR parameter must be canonical text")
+            self.parameter = args[0]
+            return [(self.plan,)]
+        raise AssertionError(f"unexpected fetch statement: {statement!r}")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def verifier() -> dict[str, Any]:
     """Load the verification script without invoking its command-line entry point."""
     return runpy.run_path(str(ROOT / "scripts/verify_crdb.py"))
@@ -214,6 +265,22 @@ async def configured_grants_check(
     monkeypatch.setenv("DATABASE_URL_SCHEMA_ADMIN", SCHEMA_DATABASE_URL)
     monkeypatch.setattr(namespace["asyncpg"], "connect", connect)
     await namespace["grants_check"]()
+
+
+async def configured_vector_check(
+    monkeypatch: pytest.MonkeyPatch,
+    namespace: dict[str, Any],
+    connection: FakeVectorConnection,
+) -> None:
+    """Run vector_check against one isolated fake connection."""
+
+    async def connect(*, dsn: str) -> FakeVectorConnection:
+        assert dsn == SCHEMA_DATABASE_URL
+        return connection
+
+    monkeypatch.setenv("DATABASE_URL_SCHEMA_ADMIN", SCHEMA_DATABASE_URL)
+    monkeypatch.setattr(namespace["asyncpg"], "connect", connect)
+    await namespace["vector_check"]()
 
 
 @pytest.mark.asyncio
@@ -476,5 +543,91 @@ async def test_grants_check_preserves_public_and_mutable_privilege_rejection(
 
     with pytest.raises(namespace["EvidenceBlocked"]):
         await configured_grants_check(monkeypatch, namespace, connection)
+
+    assert connection.closed
+
+
+@pytest.mark.parametrize("axis", (0, 731))
+def test_probe_vector_is_canonical_text_with_exact_components(axis: int) -> None:
+    namespace = verifier()
+    probe = namespace["probe_vector"](axis)
+
+    assert isinstance(probe, str)
+    assert probe.startswith("[") and probe.endswith("]")
+    components = probe[1:-1].split(",")
+    assert len(components) == 1536
+    assert components[axis] == "1.0"
+    assert all(
+        component == ("1.0" if ordinal == axis else "0.0")
+        for ordinal, component in enumerate(components)
+    )
+    assert all(math.isfinite(float(component)) for component in components)
+
+
+@pytest.mark.parametrize("axis", (-1, 1536))
+def test_probe_vector_blocks_out_of_range_axis(axis: int) -> None:
+    namespace = verifier()
+
+    with pytest.raises(namespace["EvidenceBlocked"], match="axis is out of range"):
+        namespace["probe_vector"](axis)
+
+
+@pytest.mark.asyncio
+async def test_vector_check_uses_canonical_text_and_preserves_exact_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = verifier()
+    plan = "vector search using idx_proposals_embedding"
+    connection = FakeVectorConnection(plan)
+
+    await configured_vector_check(monkeypatch, namespace, connection)
+
+    assert isinstance(connection.parameter, str)
+    assert not isinstance(connection.parameter, list)
+    assert connection.parameter == namespace["probe_vector"](0)
+    assert connection.calls == [
+        ("SHOW CREATE TABLE proposals", ()),
+        (INDEX_STATEMENT, ()),
+        ("EXPLAIN " + SIMILARITY_QUERY, (connection.parameter,)),
+    ]
+    assert "$1::VECTOR" in SIMILARITY_QUERY
+    assert SIMILARITY_QUERY.endswith("LIMIT 5")
+    assert "vector search" in plan
+    assert "idx_proposals_embedding" in plan
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "plan",
+    (
+        "vector search without the required index",
+        "scan using idx_proposals_embedding",
+    ),
+)
+async def test_vector_check_blocks_missing_plan_witness(
+    monkeypatch: pytest.MonkeyPatch, plan: str
+) -> None:
+    namespace = verifier()
+    connection = FakeVectorConnection(plan)
+
+    with pytest.raises(namespace["EvidenceBlocked"], match="query plan"):
+        await configured_vector_check(monkeypatch, namespace, connection)
+
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+async def test_vector_check_preserves_index_metadata_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = verifier()
+    connection = FakeVectorConnection(
+        "vector search using idx_proposals_embedding",
+        metadata_index_present=False,
+    )
+
+    with pytest.raises(namespace["EvidenceBlocked"], match="index metadata"):
+        await configured_vector_check(monkeypatch, namespace, connection)
 
     assert connection.closed

@@ -415,11 +415,13 @@ async def grants_check() -> None:
             blocked("runtime role authority exceeds matrix")
 
 
-def probe_vector(axis: int) -> list[float]:
-    """Create one deterministic 1536-dimensional probe."""
-    result = [0.0] * 1536
-    result[axis] = 1.0
-    return result
+def probe_vector(axis: int) -> str:
+    """Create one canonical 1536-dimensional VECTOR text probe."""
+    if type(axis) is not int or not 0 <= axis < 1536:
+        blocked("vector probe axis is out of range")
+    components = ["0.0"] * 1536
+    components[axis] = "1.0"
+    return "[" + ",".join(components) + "]"
 
 
 async def vector_check() -> None:
