@@ -380,7 +380,7 @@ async def grants_check() -> None:
         )
         options = await connection.fetch(
             """
-            SELECT username, "isRole", "canLogin", "createDB", "createRole"
+            SELECT username, options
               FROM [SHOW ROLES]
              WHERE username = ANY($1::STRING[])
              ORDER BY username
@@ -406,10 +406,12 @@ async def grants_check() -> None:
         }
         if observed != EXPECTED_INSERTS[role]:
             blocked(f"INSERT grant mismatch: {role}")
-    if len(options) != len(ROLES):
+    usernames = [row["username"] for row in options]
+    if len(usernames) != len(ROLES) or set(usernames) != set(ROLES):
         blocked("runtime role inventory mismatch")
     for row in options:
-        if not row["isRole"] or row["canLogin"] or row["createDB"] or row["createRole"]:
+        value = row["options"]
+        if not isinstance(value, list) or value != ["NOLOGIN"]:
             blocked("runtime role authority exceeds matrix")
 
 

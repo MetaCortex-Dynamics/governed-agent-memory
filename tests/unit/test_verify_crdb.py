@@ -22,6 +22,19 @@ TABLE_INVENTORY_STATEMENT = """
             """
 INDEX_STATEMENT = "SHOW INDEX FROM proposals"
 TARGETLESS_INDEX_STATEMENT = "SHOW INDEXES"
+GRANTS_STATEMENT = """
+            SELECT grantee, table_name, privilege_type
+              FROM information_schema.table_privileges
+             WHERE table_schema='public'
+             ORDER BY grantee, table_name, privilege_type
+            """
+ROLE_OPTIONS_STATEMENT = """
+            SELECT username, options
+              FROM [SHOW ROLES]
+             WHERE username = ANY($1::STRING[])
+             ORDER BY username
+            """
+LEGACY_ROLE_COLUMNS = ('"isRole"', '"canLogin"', '"createDB"', '"createRole"')
 
 
 class DatabaseFailure(RuntimeError):
@@ -95,6 +108,31 @@ class FakeSchemaConnection:
         self.closed = True
 
 
+class FakeGrantsConnection:
+    """Record grant verification without opening a database connection."""
+
+    def __init__(
+        self,
+        grants: list[dict[str, Any]],
+        role_options: list[dict[str, object]],
+    ) -> None:
+        self.grants = grants
+        self.role_options = role_options
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.closed = False
+
+    async def fetch(self, statement: str, *args: object) -> list[dict[str, Any]]:
+        self.calls.append((statement, args))
+        if statement == GRANTS_STATEMENT:
+            return list(self.grants)
+        if statement == ROLE_OPTIONS_STATEMENT:
+            return list(self.role_options)
+        raise AssertionError(f"unexpected fetch statement: {statement!r}")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def verifier() -> dict[str, Any]:
     """Load the verification script without invoking its command-line entry point."""
     return runpy.run_path(str(ROOT / "scripts/verify_crdb.py"))
@@ -143,6 +181,39 @@ async def run_schema_check(
     monkeypatch.setattr(namespace["asyncpg"], "connect", connect)
     await namespace["schema_check"]()
     return namespace, connection
+
+
+def canonical_grants(namespace: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the exact INSERT matrix consumed by grants_check."""
+    return [
+        {"grantee": role, "table_name": table, "privilege_type": "INSERT"}
+        for role in namespace["ROLES"]
+        for table in sorted(namespace["EXPECTED_INSERTS"][role])
+    ]
+
+
+def canonical_role_options(namespace: dict[str, Any]) -> list[dict[str, object]]:
+    """Build the exact four-role NOLOGIN result."""
+    return [
+        {"username": role, "options": ["NOLOGIN"]}
+        for role in sorted(namespace["ROLES"])
+    ]
+
+
+async def configured_grants_check(
+    monkeypatch: pytest.MonkeyPatch,
+    namespace: dict[str, Any],
+    connection: FakeGrantsConnection,
+) -> None:
+    """Run grants_check against one isolated fake connection."""
+
+    async def connect(*, dsn: str) -> FakeGrantsConnection:
+        assert dsn == SCHEMA_DATABASE_URL
+        return connection
+
+    monkeypatch.setenv("DATABASE_URL_SCHEMA_ADMIN", SCHEMA_DATABASE_URL)
+    monkeypatch.setattr(namespace["asyncpg"], "connect", connect)
+    await namespace["grants_check"]()
 
 
 @pytest.mark.asyncio
@@ -274,4 +345,136 @@ async def test_schema_check_preserves_database_and_table_inventory_failures(
         ("fetchval", "SELECT current_database()"),
         ("fetch", TABLE_INVENTORY_STATEMENT),
     ]
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+async def test_grants_check_accepts_exact_four_nologin_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = verifier()
+    connection = FakeGrantsConnection(
+        canonical_grants(namespace),
+        canonical_role_options(namespace),
+    )
+
+    await configured_grants_check(monkeypatch, namespace, connection)
+
+    assert connection.calls == [
+        (GRANTS_STATEMENT, ()),
+        (ROLE_OPTIONS_STATEMENT, (list(namespace["ROLES"]),)),
+    ]
+    assert all(column not in ROLE_OPTIONS_STATEMENT for column in LEGACY_ROLE_COLUMNS)
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+async def test_grants_check_blocks_missing_runtime_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = verifier()
+    options = canonical_role_options(namespace)[:-1]
+    connection = FakeGrantsConnection(canonical_grants(namespace), options)
+
+    with pytest.raises(namespace["EvidenceBlocked"], match="role inventory"):
+        await configured_grants_check(monkeypatch, namespace, connection)
+
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elevated", ("LOGIN", "CREATEDB", "CREATEROLE", "CREATELOGIN"))
+async def test_grants_check_blocks_authority_enhancing_role_options(
+    monkeypatch: pytest.MonkeyPatch, elevated: str
+) -> None:
+    namespace = verifier()
+    options = canonical_role_options(namespace)
+    options[0] = {"username": options[0]["username"], "options": ["NOLOGIN", elevated]}
+    connection = FakeGrantsConnection(canonical_grants(namespace), options)
+
+    with pytest.raises(namespace["EvidenceBlocked"], match="authority exceeds"):
+        await configured_grants_check(monkeypatch, namespace, connection)
+
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        ["NOLOGIN", "FUTURE_AUTHORITY"],
+        "NOLOGIN",
+        None,
+        [],
+        [1],
+        ["nologin"],
+    ),
+)
+async def test_grants_check_blocks_unknown_or_malformed_options(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    namespace = verifier()
+    options = canonical_role_options(namespace)
+    options[0] = {"username": options[0]["username"], "options": malformed}
+    connection = FakeGrantsConnection(canonical_grants(namespace), options)
+
+    with pytest.raises(namespace["EvidenceBlocked"], match="authority exceeds"):
+        await configured_grants_check(monkeypatch, namespace, connection)
+
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("missing", "extra"))
+async def test_grants_check_preserves_exact_insert_matrix(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    namespace = verifier()
+    grants = canonical_grants(namespace)
+    if mutation == "missing":
+        grants.pop()
+    else:
+        grants.append(
+            {
+                "grantee": "gam_reader_role",
+                "table_name": "proposals",
+                "privilege_type": "INSERT",
+            }
+        )
+    connection = FakeGrantsConnection(grants, canonical_role_options(namespace))
+
+    with pytest.raises(namespace["EvidenceBlocked"], match="INSERT grant mismatch"):
+        await configured_grants_check(monkeypatch, namespace, connection)
+
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forbidden_grant",
+    (
+        {"grantee": "public", "table_name": "proposals", "privilege_type": "SELECT"},
+        {
+            "grantee": "gam_app_role",
+            "table_name": "proposals",
+            "privilege_type": "UPDATE",
+        },
+        {
+            "grantee": "gam_executor_role",
+            "table_name": "proposals",
+            "privilege_type": "DELETE",
+        },
+    ),
+)
+async def test_grants_check_preserves_public_and_mutable_privilege_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+    forbidden_grant: dict[str, Any],
+) -> None:
+    namespace = verifier()
+    grants = [*canonical_grants(namespace), forbidden_grant]
+    connection = FakeGrantsConnection(grants, canonical_role_options(namespace))
+
+    with pytest.raises(namespace["EvidenceBlocked"]):
+        await configured_grants_check(monkeypatch, namespace, connection)
+
     assert connection.closed
