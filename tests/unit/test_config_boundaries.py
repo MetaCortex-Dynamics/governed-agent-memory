@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from src.ccloud_tool import CLUSTER_NAME
 from src.config import (
     AppDbConfig,
     BoundCrdbVersion,
@@ -47,7 +48,7 @@ def artifact_fixture(tmp_path: Path) -> tuple[Path, str]:
         "provisioning_receipt_digest": "3" * 64,
         "preprovision_record_sha256": "4" * 64,
         "preprovision_evidence_digest": "5" * 64,
-        "preprovision_observed_at": "2026-08-16T12:00:00.000000Z",
+        "preprovision_observed_at": "2026-08-16T12:00:00Z",
         "setup_promotion_digest": "6" * 64,
         "schema_admin_handle_digest": "7" * 64,
         "target_state": "CREATED",
@@ -174,6 +175,105 @@ def test_preflight_writer_round_trips_exactly_through_bound_loader(
     assert loaded.required_version_family == "v26.2"
     assert loaded.observed_cockroach_version == "v26.2.5"
     assert loaded.ccloud_version == "v0.6.12"
+
+
+def test_canonical_preprovision_builds_exact_loadable_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    namespace: dict[str, Any] = runpy.run_path(str(ROOT / "scripts/verify_crdb.py"))
+    executable = tmp_path / "ccloud"
+    executable.write_bytes(b"unit executable")
+    admin_handle = "unit-schema-admin-handle"
+    profile = "unit-profile-label"
+    payload: dict[str, object] = {
+        "schema": "gam.cluster-preprovision.v1",
+        "admin_handle_digest": digest(admin_handle.encode()),
+        "captured_at": "2026-08-16T12:00:00Z",
+        "cloud": "AWS",
+        "cluster_id_digest": "2" * 64,
+        "cluster_name": CLUSTER_NAME,
+        "cluster_name_digest": digest(CLUSTER_NAME.encode()),
+        "cockroach_version": "v26.2.5",
+        "plan": "SERVERLESS",
+        "promotion_digest": "6" * 64,
+        "provisioning_receipt_digest": "3" * 64,
+        "regions": ["us-east-1"],
+        "spend_limit_usd": "0",
+        "state": "CREATED",
+    }
+    record = {**payload, "evidence_digest": digest(canonical(payload))}
+    source = tmp_path / "preprovision.json"
+    source.write_bytes(canonical(record))
+    monkeypatch.setenv("CRDB_PREPROVISION_EVIDENCE_FILE", str(source))
+    monkeypatch.setenv("CRDB_PREPROVISION_EVIDENCE_SHA256", digest(source.read_bytes()))
+    monkeypatch.setenv("CRDB_SETUP_PROMOTION_DIGEST", "6" * 64)
+    monkeypatch.setenv("CRDB_SCHEMA_ADMIN_HANDLE", admin_handle)
+    monkeypatch.setenv("CCLOUD_CLUSTER_NAME", CLUSTER_NAME)
+    monkeypatch.setenv("CCLOUD_AUTH_PROFILE", profile)
+    monkeypatch.setenv("CCLOUD_EXPECTED_CLUSTER_ID_DIGEST", "2" * 64)
+    monkeypatch.setenv("CCLOUD_PROVISIONING_RECEIPT_DIGEST", "3" * 64)
+    loaded_record, raw = namespace["load_preprovision"]()
+    tool = {
+        "ccloud_executable": str(executable.resolve()),
+        "ccloud_executable_sha256": digest(executable.read_bytes()),
+        "ccloud_version": "v0.6.12",
+        "ccloud_version_raw_digest": "8" * 64,
+        "ccloud_help_digest": "9" * 64,
+        "ccloud_json_flag": "--output=json",
+    }
+    server = {
+        "required_version_family": "v26.2",
+        "observed_cockroach_version": "v26.2.5",
+        "cockroach_version_raw_digest": "1" * 64,
+        "feature_vector_index_enabled": True,
+    }
+    artifact = namespace["build_preflight_artifact"](loaded_record, raw, tool, server)
+    output = tmp_path / "generated" / "crdb-version.json"
+    writer = namespace["atomic_artifact"]
+    writer.__globals__["VERSION_ARTIFACT"] = output
+    writer(artifact)
+    assert output.read_bytes() == canonical(artifact)
+    assert not output.read_bytes().endswith(b"\n")
+    loaded = BoundCrdbVersion.load(output)
+    assert loaded.payload() == {
+        key: value for key, value in artifact.items() if key != "capture_digest"
+    }
+    assert loaded.capture_digest == artifact["capture_digest"]
+
+
+def test_env_example_binds_executable_cluster_name() -> None:
+    assignments = dict(
+        line.split("=", 1)
+        for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+    assert assignments["CCLOUD_CLUSTER_NAME"] == CLUSTER_NAME
+
+
+@pytest.mark.parametrize(
+    "observed_at",
+    [
+        "2026-08-16T12:00:00.000000Z",
+        "2026-08-16T12:00:00+00:00",
+        "2026-08-16T12:00:00z",
+        "2026-08-16 12:00:00Z",
+        "2026-13-16T12:00:00Z",
+    ],
+)
+def test_bound_artifact_rejects_noncanonical_preprovision_timestamp(
+    tmp_path: Path,
+    observed_at: str,
+) -> None:
+    path, _ = artifact_fixture(tmp_path)
+    value = json.loads(path.read_bytes())
+    value["preprovision_observed_at"] = observed_at
+    value["capture_digest"] = digest(
+        canonical({key: item for key, item in value.items() if key != "capture_digest"})
+    )
+    path.write_bytes(canonical(value))
+    with pytest.raises(ConfigError, match="timestamp"):
+        BoundCrdbVersion.load(path)
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
@@ -234,10 +235,9 @@ class BoundCrdbVersion:
             raise ConfigError("bound ccloud executable identity mismatch")
         try:
             observed_at = self.preprovision_observed_at
-            if not re.fullmatch(
-                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", observed_at
-            ):
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", observed_at):
                 raise ValueError
+            datetime.strptime(observed_at, "%Y-%m-%dT%H:%M:%SZ")
         except (TypeError, ValueError) as error:
             raise ConfigError("preprovision timestamp is invalid") from error
         if self.capture_digest != _digest(_canonical_bytes(self.payload())):

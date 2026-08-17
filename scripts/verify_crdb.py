@@ -289,11 +289,13 @@ def atomic_artifact(value: Mapping[str, Any]) -> None:
         raise
 
 
-async def preflight() -> None:
-    """Run the complete authorized read-only preflight."""
-    record, raw = load_preprovision()
-    tool = discover_preflight()
-    server = await server_preflight(database_url("DATABASE_URL_SCHEMA_ADMIN"))
+def build_preflight_artifact(
+    record: Mapping[str, Any],
+    raw: bytes,
+    tool: Mapping[str, str],
+    server: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Construct the canonical credential-free preflight artifact."""
     if server["observed_cockroach_version"] != record["cockroach_version"]:
         blocked("observed CockroachDB release differs from preprovision evidence")
     raw_digest = sha256_bytes(raw)
@@ -331,9 +333,16 @@ async def preflight() -> None:
         "ccloud_auth_profile_digest": config["ccloud_auth_profile_digest"],
         "ccloud_json_flag": tool["ccloud_json_flag"],
     }
-    capture_payload = dict(artifact)
-    artifact["capture_digest"] = canonical_digest(capture_payload)
-    atomic_artifact(artifact)
+    artifact["capture_digest"] = canonical_digest(artifact)
+    return artifact
+
+
+async def preflight() -> None:
+    """Run the complete authorized read-only preflight."""
+    record, raw = load_preprovision()
+    tool = discover_preflight()
+    server = await server_preflight(database_url("DATABASE_URL_SCHEMA_ADMIN"))
+    atomic_artifact(build_preflight_artifact(record, raw, tool, server))
 
 
 async def schema_check() -> None:
