@@ -69,11 +69,10 @@ async def run_server_preflight(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("setting", ("true", " TRUE "))
 async def test_server_preflight_uses_only_supported_setting_statement(
-    monkeypatch: pytest.MonkeyPatch, setting: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result, connection = await run_server_preflight(monkeypatch, setting)
+    result, connection = await run_server_preflight(monkeypatch, True)
 
     assert result["feature_vector_index_enabled"] is True
     assert [call[0] for call in connection.calls] == [
@@ -86,7 +85,7 @@ async def test_server_preflight_uses_only_supported_setting_statement(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("setting", ("false", None, "enabled", "", True, 1))
+@pytest.mark.parametrize("setting", (False, "true", "TRUE", 1, None))
 async def test_server_preflight_blocks_non_true_setting_values(
     monkeypatch: pytest.MonkeyPatch, setting: object
 ) -> None:
@@ -110,7 +109,7 @@ async def test_server_preflight_propagates_database_setting_errors(
 ) -> None:
     failure = DatabaseFailure("synthetic database failure")
     namespace = verifier()
-    connection = FakeConnection("true", setting_error=failure)
+    connection = FakeConnection(True, setting_error=failure)
 
     async def connect(*, dsn: str) -> FakeConnection:
         return connection

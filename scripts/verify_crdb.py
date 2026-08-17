@@ -216,7 +216,7 @@ async def server_preflight(url: str) -> dict[str, Any]:
     observed_version = normalize_release(version_raw)
     if not observed_version.startswith(f"{REQUIRED_VERSION_FAMILY}."):
         blocked("server release family mismatch")
-    if not isinstance(setting, str) or setting.strip().casefold() != "true":
+    if setting is not True:
         blocked("vector indexing is disabled")
     if collision != 0:
         blocked("target database already exists")
