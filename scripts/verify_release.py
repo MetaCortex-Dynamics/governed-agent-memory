@@ -59,7 +59,11 @@ INITIAL_INVENTORY = (
     "tests/test_skeleton.py",
     "tests/unit/.gitkeep",
 )
-EXECUTABLES = {"lambda/deploy.sh", "scripts/clean_clone_smoke.sh"}
+EXECUTABLES = {
+    "lambda/deploy.sh",
+    "schema/deploy.sh",
+    "scripts/clean_clone_smoke.sh",
+}
 
 
 def resolve_git() -> str:
