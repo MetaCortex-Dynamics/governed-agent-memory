@@ -306,3 +306,43 @@ def test_capture_uses_bound_canonical_argv_and_preserves_both_plans(
     assert result["redacted_command_argv"][-1] == "--output=json"
     assert result["normalized_redacted_output"]["wire_plan"] == "SERVERLESS"
     assert result["normalized_redacted_output"]["plan"] == "BASIC"
+
+
+@pytest.mark.asyncio
+async def test_runtime_capture_returns_frozen_tool_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "ccloud"
+    executable.write_bytes(b"official-ccloud-0.6.12")
+    profile = "local-test-profile"
+    artifact = target_artifact(executable, profile)
+    monkeypatch.setenv("CCLOUD_CLUSTER_NAME", ccloud_tool.CLUSTER_NAME)
+    monkeypatch.setenv("CCLOUD_AUTH_PROFILE", profile)
+    monkeypatch.setenv("CCLOUD_EXPECTED_CLUSTER_ID_DIGEST", SYNTHETIC_CLUSTER_DIGEST)
+    monkeypatch.setenv("CCLOUD_PROVISIONING_RECEIPT_DIGEST", "2" * 64)
+    monkeypatch.setattr(ccloud_tool, "load_version_artifact", lambda: artifact)
+
+    def fake_process(path: Path, arguments: tuple[str, ...]) -> ProcessReceipt:
+        raw = ccloud_tool.canonical_bytes(observed_record())
+        return ProcessReceipt(
+            (str(path), *arguments),
+            raw,
+            b"",
+            0,
+            ccloud_tool.sha256_bytes(b"stdout\0" + raw + b"\0stderr\0"),
+        )
+
+    monkeypatch.setattr(ccloud_tool, "bounded_process", fake_process)
+    result = await ccloud_tool.capture(purpose="runtime")
+    assert result.tool_name == "ccloud"
+    assert result.cluster_name == "kingly-dreamer"
+    assert result.observed_state == "CREATED"
+    assert result.observed_plan == "BASIC"
+    assert result.evidence_digest
+
+
+@pytest.mark.asyncio
+async def test_runtime_capture_rejects_every_other_purpose() -> None:
+    with pytest.raises(EvidenceBlocked, match="purpose"):
+        await ccloud_tool.capture(purpose="closure")

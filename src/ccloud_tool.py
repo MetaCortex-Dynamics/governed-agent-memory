@@ -22,6 +22,8 @@ from uuid import uuid4
 
 import asyncpg  # type: ignore[import-untyped]
 
+from src.models import ToolEvidence
+
 MAX_OUTPUT_BYTES = 65_536
 COMMAND_TIMEOUT_SECONDS = 10.0
 CLUSTER_NAME = "kingly-dreamer"
@@ -563,6 +565,49 @@ def build_capture(artifact: Mapping[str, Any]) -> dict[str, Any]:
         {"schema": "gam.tool-evidence.v1", **digest_payload}
     )
     return evidence_payload
+
+
+def _tool_evidence(payload: Mapping[str, Any], evidence_id: str) -> ToolEvidence:
+    """Convert one already-redacted capture into the frozen memory contract."""
+    return ToolEvidence(
+        evidence_id=evidence_id,
+        tool_name=str(payload["tool_name"]),
+        tool_version=str(payload["tool_version"]),
+        redacted_command_argv_json=canonical_bytes(
+            payload["redacted_command_argv"]
+        ).decode(),
+        command_digest=str(payload["command_digest"]),
+        help_digest=str(payload["help_digest"]),
+        config_digest=str(payload["config_digest"]),
+        cluster_name=str(payload["cluster_name"]),
+        cluster_name_digest=str(payload["cluster_name_digest"]),
+        observed_cluster_id_digest=str(payload["observed_cluster_id_digest"]),
+        observed_version=str(payload["observed_version"]),
+        observed_state=str(payload["observed_state"]),
+        observed_plan=str(payload["observed_plan"]),
+        observed_cloud=str(payload["observed_cloud"]),
+        normalized_redacted_output_json=canonical_bytes(
+            payload["normalized_redacted_output"]
+        ).decode(),
+        redaction_manifest_json=canonical_bytes(payload["redaction_manifest"]).decode(),
+        raw_output_digest=str(payload["raw_output_digest"]),
+        normalized_output_digest=str(payload["normalized_output_digest"]),
+        exit_status=int(payload["exit_status"]),
+        captured_at=str(payload["captured_at"]),
+        expires_at=str(payload["expires_at"]),
+        captured_by=str(payload["captured_by"]),
+        evidence_digest=str(payload["evidence_digest"]),
+        idempotency_key=str(payload["idempotency_key"]),
+    )
+
+
+async def capture(*, purpose: str) -> ToolEvidence:
+    """Run exactly one closure-bound read-only capture for the runtime agent."""
+    if purpose != "runtime":
+        _blocked("ccloud capture purpose is not permitted")
+    artifact = load_version_artifact()
+    payload = await asyncio.to_thread(build_capture, artifact)
+    return _tool_evidence(payload, str(uuid4()))
 
 
 async def capture_closure() -> dict[str, Any]:
