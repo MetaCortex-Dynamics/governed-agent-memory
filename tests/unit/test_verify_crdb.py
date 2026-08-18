@@ -138,19 +138,31 @@ class FakeSchemaConnection:
         if statement == GATE_INDEX_STATEMENT:
             if self.profile_index_name is None:
                 return []
-            return [
+            explicit_rows = [
                 {
                     "index_name": self.profile_index_name,
                     "seq_in_index": sequence,
                     "column_name": column,
                     "direction": direction,
                     "storing": False,
+                    "implicit": False,
                     "non_unique": self.profile_index_non_unique,
                 }
                 for sequence, column, direction in (
                     (1, "profile_version", "ASC"),
                     (2, "created_at", "DESC"),
                 )
+            ]
+            return explicit_rows + [
+                {
+                    "index_name": self.profile_index_name,
+                    "seq_in_index": 3,
+                    "column_name": "id",
+                    "direction": "ASC",
+                    "storing": False,
+                    "implicit": True,
+                    "non_unique": self.profile_index_non_unique,
+                }
             ]
         raise AssertionError(f"unexpected fetch statement: {statement!r}")
 
@@ -427,6 +439,19 @@ async def test_schema_check_blocks_unique_profile_version(
     with pytest.raises(namespace["EvidenceBlocked"], match="remains unique"):
         await namespace["schema_check"]()
 
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+async def test_schema_check_ignores_only_implicit_primary_key_index_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace, connection = await run_schema_check(monkeypatch)
+
+    target_rows = await connection.fetch(GATE_INDEX_STATEMENT)
+    assert any(
+        row["column_name"] == "id" and row["implicit"] is True for row in target_rows
+    )
     assert connection.closed
 
 

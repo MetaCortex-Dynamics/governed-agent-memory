@@ -127,6 +127,7 @@ async def test_profile_version_is_non_unique_and_indexed_live() -> None:
             for row in indexes
             if row["index_name"] == "idx_gate_eval_profile_created"
             and not row["storing"]
+            and not row["implicit"]
         )
         assert profile_index == [
             (1, "profile_version", "ASC"),

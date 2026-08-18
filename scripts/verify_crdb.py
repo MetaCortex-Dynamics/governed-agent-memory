@@ -392,6 +392,7 @@ async def schema_check() -> None:
         for row in gate_indexes
         if row["index_name"] == "idx_gate_eval_profile_created"
         and not bool(row.get("storing", False))
+        and not bool(row.get("implicit", False))
     )
     if profile_index != [
         (1, "profile_version", "ASC"),
