@@ -15,6 +15,7 @@ from src.embeddings import (
     embed_one,
     embedding_input_digest,
     embedding_output_digest,
+    normalize_embedding_vector,
 )
 
 
@@ -70,8 +71,16 @@ async def test_embed_one_uses_exact_model_dimensions_and_input() -> None:
 async def test_embed_many_preserves_cardinality_and_order() -> None:
     client = Client(Response([Item(0, vector(0.1)), Item(1, vector(0.2))]))
     result = await embed_many(("first", "second"), config=config(), client=client)
-    assert result[0][0] == 0.1
-    assert result[1][0] == 0.2
+    assert result[0][0] == normalize_embedding_vector(vector(0.1))[0]
+    assert result[1][0] == normalize_embedding_vector(vector(0.2))[0]
+
+
+def test_vector_normalization_is_exact_binary32_and_idempotent() -> None:
+    original = tuple(vector(0.1))
+    normalized = normalize_embedding_vector(original)
+    assert normalized != original
+    assert normalize_embedding_vector(normalized) == normalized
+    assert len(normalized) == EMBEDDING_DIMENSIONS
 
 
 @pytest.mark.parametrize("texts", ((), ("",), (" padded ",)))
@@ -122,6 +131,16 @@ def test_input_and_output_digests_are_deterministic_and_bound() -> None:
     assert embedding_output_digest(texts, vectors) != embedding_output_digest(
         texts, changed
     )
+    persisted = tuple(normalize_embedding_vector(vector) for vector in vectors)
+    assert embedding_output_digest(texts, vectors) == embedding_output_digest(
+        texts, persisted
+    )
+
+
+@pytest.mark.parametrize("value", (float("inf"), float("-inf"), 1e100))
+def test_vector_normalization_rejects_non_persistable_values(value: float) -> None:
+    with pytest.raises(EmbeddingError):
+        normalize_embedding_vector(vector(value))
 
 
 @pytest.mark.asyncio

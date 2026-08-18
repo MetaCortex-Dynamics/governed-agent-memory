@@ -5,21 +5,26 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib
+import json
 from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from src.embeddings import normalize_embedding_vector
+from src.governance import proposal_action_digest, proposal_record_digest
 from src.memory import (
     CCLOUD_CLUSTER_NAME,
     AppMemory,
     MemoryConflictError,
     MemoryIntegrityError,
     _enum,
+    _plain_json,
+    _proposal_from_mapping,
     _tool_evidence_digest,
     _validate_tool_evidence,
 )
@@ -217,6 +222,40 @@ def test_database_enum_decoder_accepts_string_columns_and_canonical_json(
 def test_database_enum_decoder_rejects_unknown_string_member(stored: str) -> None:
     with pytest.raises(MemoryIntegrityError, match="stored enum member"):
         _enum(stored, Verdict)
+
+
+def test_database_json_decoder_restores_canonical_semantic_bytes() -> None:
+    assert _plain_json('{"value": "ready", "count": 1.0}') == (
+        '{"count":1,"value":"ready"}'
+    )
+    assert _plain_json('[true, null, {"z": 2, "a": 1}]') == (
+        '[true,null,{"a":1,"z":2}]'
+    )
+
+
+def test_proposal_writer_loader_round_trip_preserves_both_digests() -> None:
+    base = fixtures.make_proposal()
+    proposal = replace(
+        base,
+        parameters_json='{"value":"ready"}',
+        impact_assessment_json='{"scope":"bounded demo value"}',
+        predicted_outcome_json='{"value":"ready"}',
+        embedding=normalize_embedding_vector((0.1,) * 1536),
+    )
+    proposal = replace(proposal, action_digest=proposal_action_digest(proposal))
+    proposal = replace(proposal, proposal_digest=proposal_record_digest(proposal))
+    stored = asdict(proposal)
+    stored["id"] = stored.pop("proposal_id")
+    stored["parameters"] = '{"value": "ready"}'
+    stored["impact_assessment"] = '{"scope": "bounded demo value"}'
+    stored["predicted_outcome"] = '{"value": "ready"}'
+    stored["evidence"] = "[]"
+    stored["dependencies"] = "[]"
+    stored["embedding"] = json.dumps(list(proposal.embedding))
+    loaded = _proposal_from_mapping(stored)
+    assert loaded == proposal
+    assert loaded.action_digest == proposal_action_digest(loaded)
+    assert loaded.proposal_digest == proposal_record_digest(loaded)
 
 
 @pytest.mark.asyncio

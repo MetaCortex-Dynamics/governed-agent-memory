@@ -15,6 +15,7 @@ from typing import Any, Protocol, cast
 import asyncpg  # type: ignore[import-untyped]
 
 from src.config import AppDbConfig
+from src.embeddings import normalize_embedding_vector
 from src.models import (
     BlockedResult,
     CapabilityFact,
@@ -111,14 +112,51 @@ def _dump(value: object) -> str:
 
 def _plain_json(value: object) -> str:
     if isinstance(value, str):
-        return value
-    return json.dumps(
-        value,
-        sort_keys=True,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    )
+        try:
+            value = json.loads(value, parse_float=Decimal, parse_int=Decimal)
+        except (json.JSONDecodeError, UnicodeError):
+            raise MemoryIntegrityError("stored JSON is invalid") from None
+    return _plain_json_value(value)
+
+
+def _plain_json_value(value: object) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise MemoryIntegrityError("stored JSON number is non-finite")
+        if value.is_zero():
+            return "0"
+        text = format(value.normalize(), "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
+    if isinstance(value, float):
+        if not -float("inf") < value < float("inf"):
+            raise MemoryIntegrityError("stored JSON number is non-finite")
+        return json.dumps(value, allow_nan=False, separators=(",", ":"))
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return "[" + ",".join(_plain_json_value(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise MemoryIntegrityError("stored JSON object key is invalid")
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(key, ensure_ascii=False)}:{_plain_json_value(value[key])}"
+                for key in sorted(value, key=lambda item: item.encode("utf-8"))
+            )
+            + "}"
+        )
+    raise MemoryIntegrityError("stored JSON value is invalid")
 
 
 def _json_sha256(value: object) -> str:
@@ -306,7 +344,9 @@ def _proposal_from_mapping(raw: Mapping[str, Any]) -> Proposal:
         predicted_outcome_json=_plain_json(raw["predicted_outcome"]),
         evidence_refs=tuple(_evidence(item) for item in _tuple(raw["evidence"])),
         dependencies=tuple(_dependency(item) for item in _tuple(raw["dependencies"])),
-        embedding=tuple(_float(item) for item in cast(Sequence[object], embedding_raw)),
+        embedding=normalize_embedding_vector(
+            tuple(_float(item) for item in cast(Sequence[object], embedding_raw))
+        ),
         embedding_model=str(raw["embedding_model"]),
         embedding_input_digest=str(raw["embedding_input_digest"]),
         action_digest=str(raw["action_digest"]),

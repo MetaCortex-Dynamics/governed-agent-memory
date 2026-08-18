@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 import unicodedata
 from collections.abc import Sequence
 from typing import Any, Protocol, cast
@@ -46,15 +47,17 @@ def embedding_input_digest(texts: tuple[str, ...]) -> str:
 def embedding_output_digest(
     texts: tuple[str, ...], vectors: tuple[tuple[float, ...], ...]
 ) -> str:
-    """Bind ordered validated vectors to their exact input digest."""
+    """Bind ordered vectors in the exact CockroachDB VECTOR precision domain."""
     texts = _canonical_texts(texts)
-    _validate_vectors(vectors, len(texts))
+    if len(vectors) != len(texts):
+        raise EmbeddingError("embedding response cardinality mismatch")
+    normalized = tuple(normalize_embedding_vector(vector) for vector in vectors)
     return canonical_sha256(
         {
             "model": EMBEDDING_MODEL,
             "dimensions": EMBEDDING_DIMENSIONS,
             "input_digest": embedding_input_digest(texts),
-            "output": vectors,
+            "output": normalized,
         }
     )
 
@@ -88,6 +91,29 @@ def _validate_vectors(
             raise EmbeddingError("embedding response contains an invalid value")
 
 
+def normalize_embedding_vector(vector: Sequence[float]) -> tuple[float, ...]:
+    """Normalize one vector to CockroachDB's persisted IEEE-754 binary32 values."""
+    if len(vector) != EMBEDDING_DIMENSIONS:
+        raise EmbeddingError("embedding response dimensions mismatch")
+    normalized: list[float] = []
+    for value in vector:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise EmbeddingError("embedding response contains an invalid value")
+        candidate = float(value)
+        if not math.isfinite(candidate):
+            raise EmbeddingError("embedding response contains an invalid value")
+        try:
+            persisted = struct.unpack("!f", struct.pack("!f", candidate))[0]
+        except (OverflowError, struct.error):
+            raise EmbeddingError(
+                "embedding response contains an invalid value"
+            ) from None
+        if not math.isfinite(persisted):
+            raise EmbeddingError("embedding response contains an invalid value")
+        normalized.append(persisted)
+    return tuple(normalized)
+
+
 def _client(config: EmbeddingConfig) -> _EmbeddingClient:
     options: dict[str, Any] = {"timeout": 20.0, "max_retries": 2}
     options["api_" + "key"] = config.api_key
@@ -114,7 +140,7 @@ def _response_vectors(
             for value in embedding
         ):
             raise EmbeddingError("embedding response item is malformed")
-        vector = tuple(float(value) for value in embedding)
+        vector = normalize_embedding_vector(cast(Sequence[float], embedding))
         indexed.append((index, vector))
     if tuple(index for index, _ in indexed) != tuple(range(expected_count)):
         raise EmbeddingError("embedding response order is invalid")
@@ -166,4 +192,5 @@ __all__ = [
     "embed_one",
     "embedding_input_digest",
     "embedding_output_digest",
+    "normalize_embedding_vector",
 ]
