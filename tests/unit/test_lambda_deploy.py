@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -9,11 +10,14 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 
 
-def test_lockfiles_are_byte_identical_pinned_and_hashed() -> None:
+def test_runtime_lock_is_distinct_pinned_hashed_and_runtime_only() -> None:
     root = (ROOT / "requirements.lock").read_bytes()
     deployed = (ROOT / "lambda/requirements.txt").read_bytes()
-    assert root == deployed
-    text = root.decode()
+    assert hashlib.sha256(root).hexdigest() == (
+        "e9413bf0a6069a1f4939c1cd3ad17ee935728671d117be62a1937da4e46e8f57"
+    )
+    assert root != deployed
+    text = deployed.decode()
     logical = re.sub(r"\\\n\s*", " ", text)
     requirements = [
         line.strip()
@@ -23,6 +27,40 @@ def test_lockfiles_are_byte_identical_pinned_and_hashed() -> None:
     assert requirements
     assert all("==" in line and "--hash=sha256:" in line for line in requirements)
     assert "--only-binary :all:" in text
+    assert "--strip-extras requirements.txt" in text
+    assert "requirements-dev.txt" not in text
+    names = set(re.findall(r"(?m)^([A-Za-z0-9_.-]+)==", text))
+    assert names == {
+        "annotated-types",
+        "anyio",
+        "asyncpg",
+        "distro",
+        "h11",
+        "httpcore2",
+        "httpx2",
+        "idna",
+        "jiter",
+        "markdown-it-py",
+        "mdurl",
+        "openai",
+        "pydantic",
+        "pydantic-core",
+        "pygments",
+        "rich",
+        "sniffio",
+        "tqdm",
+        "truststore",
+        "typing-extensions",
+        "typing-inspection",
+    }
+    assert not names & {
+        "bandit",
+        "mypy",
+        "pip-audit",
+        "pytest",
+        "pytest-asyncio",
+        "ruff",
+    }
 
 
 def test_hash_enforced_linux_python_312_install_is_declared() -> None:
@@ -31,14 +69,15 @@ def test_hash_enforced_linux_python_312_install_is_declared() -> None:
         "python3.12 -m pip install",
         "--require-hashes",
         "--only-binary=:all:",
+        "--no-compile",
         "--platform manylinux_2_28_x86_64",
         "--platform manylinux2014_x86_64",
         "--implementation cp",
         "--python-version 3.12",
         "--abi cp312",
-        "cmp -s requirements.lock lambda/requirements.txt",
     )
     assert all(item in script for item in required)
+    assert "cmp -s requirements.lock lambda/requirements.txt" not in script
 
 
 def test_clean_hash_install_resolves(tmp_path: Path) -> None:
@@ -66,7 +105,7 @@ def test_clean_hash_install_resolves(tmp_path: Path) -> None:
             "--target",
             str(tmp_path / "install"),
             "-r",
-            str(ROOT / "requirements.lock"),
+            str(ROOT / "lambda/requirements.txt"),
         ],
         check=False,
         capture_output=True,
@@ -93,6 +132,40 @@ def test_deploy_copies_only_tracked_python_application_sources() -> None:
     assert "destination.chmod(0o644)" in script
     assert "--no-build-isolation" not in script
     assert '--target "$TMP_DIR/package" .' not in script
+
+
+def test_deploy_gates_runtime_inventory_imports_and_package_sizes_before_aws() -> None:
+    script = (ROOT / "lambda/deploy.sh").read_text()
+    gate = script.index(
+        'for module_name in ("asyncpg", "openai", "pydantic", "handler")'
+    )
+    compressed = script.index("compressed_limit = 50 * 1024 * 1024")
+    uncompressed = script.index("uncompressed_limit = 250 * 1024 * 1024")
+    first_aws = script.index("aws sts get-caller-identity")
+    assert gate < compressed < first_aws
+    assert uncompressed < first_aws
+    for forbidden in (
+        '"bandit"',
+        '"mypy"',
+        '"pip-audit"',
+        '"pytest"',
+        '"pytest-asyncio"',
+        '"ruff"',
+        '"__pycache__"',
+        '".pytest_cache"',
+        '"tests"',
+        '"_tests"',
+        '"_testbase"',
+        '".env"',
+        '"credentials"',
+        '".pyc"',
+        '".o"',
+        '".whl"',
+    ):
+        assert forbidden in script
+    assert 'test_directories = {"test", "tests", "_tests", "_testbase"}' in script
+    assert "shutil.rmtree(path)" in script
+    assert 'python3.12 -B - "$TMP_DIR/package"' in script
 
 
 def test_iam_template_is_exact_secret_read() -> None:

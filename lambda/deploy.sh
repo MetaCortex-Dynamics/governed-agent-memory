@@ -115,8 +115,7 @@ Path(environment_path).write_bytes(json.dumps(environment, sort_keys=True, separ
 PY
 
 mkdir --mode=0700 "$TMP_DIR/package"
-cmp -s requirements.lock lambda/requirements.txt
-python3.12 -m pip install --disable-pip-version-check --no-input \
+python3.12 -m pip install --disable-pip-version-check --no-input --no-compile \
   --only-binary=:all: --platform manylinux_2_28_x86_64 \
   --platform manylinux2014_x86_64 \
   --implementation cp --python-version 3.12 --abi cp312 --require-hashes \
@@ -137,6 +136,17 @@ tags = {
 }
 if tags != {"cp312-cp312-manylinux_2_28_x86_64"}:
     raise SystemExit("lambda-deploy: asyncpg wheel tag mismatch")
+PY
+python3.12 - "$TMP_DIR/package" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+test_directories = {"test", "tests", "_tests", "_testbase"}
+for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+    if path.is_dir() and path.name.lower() in test_directories:
+        shutil.rmtree(path)
 PY
 python3.12 - "$TMP_DIR/package" <<'PY'
 import shutil
@@ -164,16 +174,62 @@ for source in tracked:
     destination.chmod(0o644)
 PY
 install -m 0644 lambda/handler.py "$TMP_DIR/package/handler.py"
-python3.12 - "$TMP_DIR/package" <<'PY'
-import os, sys
+python3.12 -B - "$TMP_DIR/package" <<'PY'
+import importlib
+import importlib.metadata
+import re
+import sys
 from pathlib import Path
+
 root = Path(sys.argv[1])
+forbidden_distributions = {
+    "bandit", "mypy", "pip-audit", "pytest", "pytest-asyncio", "ruff"
+}
+canonical = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+installed = {
+    canonical(distribution.metadata["Name"])
+    for distribution in importlib.metadata.distributions(path=[str(root)])
+}
+if installed & forbidden_distributions:
+    raise SystemExit("lambda-deploy: development distribution in package")
+required_distributions = {"asyncpg", "openai", "pydantic"}
+if not required_distributions <= installed:
+    raise SystemExit("lambda-deploy: runtime distribution missing")
 for path in root.rglob("*"):
-    if path.is_symlink(): raise SystemExit("lambda-deploy: package symlink")
-    if path.name in {".env", "preflight.env", "crdb-version.json"}:
+    if path.is_symlink():
+        raise SystemExit("lambda-deploy: package symlink")
+    lowered_parts = {part.lower() for part in path.relative_to(root).parts}
+    if lowered_parts & {"__pycache__", ".pytest_cache", "test", "tests", "_tests", "_testbase", "build", "dist"}:
+        raise SystemExit("lambda-deploy: forbidden package directory")
+    lowered_name = path.name.lower()
+    if lowered_name in {".env", "credentials", "preflight.env", "crdb-version.json"}:
         raise SystemExit("lambda-deploy: forbidden package path")
+    if lowered_name.endswith((".pyc", ".pyo", ".o", ".obj", ".a", ".lib", ".whl", ".tar", ".tar.gz", ".zip")):
+        raise SystemExit("lambda-deploy: forbidden package artifact")
+
+sys.path.insert(0, str(root))
+for module_name in ("asyncpg", "openai", "pydantic", "handler"):
+    module = importlib.import_module(module_name)
+    module_path = Path(module.__file__ or "").resolve()
+    if not module_path.is_relative_to(root.resolve()):
+        raise SystemExit("lambda-deploy: runtime import escaped package")
 PY
 (cd "$TMP_DIR/package" && python3.12 -m zipfile -c "$TMP_DIR/package.zip" .)
+python3.12 - "$TMP_DIR/package" "$TMP_DIR/package.zip" <<'PY'
+import sys
+from pathlib import Path
+
+package = Path(sys.argv[1])
+archive = Path(sys.argv[2])
+compressed_limit = 50 * 1024 * 1024
+uncompressed_limit = 250 * 1024 * 1024
+compressed_size = archive.stat().st_size
+uncompressed_size = sum(path.stat().st_size for path in package.rglob("*") if path.is_file())
+if not 0 < compressed_size < compressed_limit:
+    raise SystemExit("lambda-deploy: compressed package size blocked")
+if not 0 < uncompressed_size < uncompressed_limit:
+    raise SystemExit("lambda-deploy: uncompressed package size blocked")
+PY
 PACKAGE_SHA256="$(sha256sum "$TMP_DIR/package.zip" | cut -d' ' -f1)"
 
 aws sts get-caller-identity --output json > "$TMP_DIR/identity.json"
