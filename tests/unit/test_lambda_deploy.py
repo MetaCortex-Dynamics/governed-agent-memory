@@ -31,6 +31,7 @@ def test_hash_enforced_linux_python_312_install_is_declared() -> None:
         "python3.12 -m pip install",
         "--require-hashes",
         "--only-binary=:all:",
+        "--platform manylinux_2_28_x86_64",
         "--platform manylinux2014_x86_64",
         "--implementation cp",
         "--python-version 3.12",
@@ -52,6 +53,16 @@ def test_clean_hash_install_resolves(tmp_path: Path) -> None:
             "--dry-run",
             "--require-hashes",
             "--only-binary=:all:",
+            "--platform",
+            "manylinux_2_28_x86_64",
+            "--platform",
+            "manylinux2014_x86_64",
+            "--implementation",
+            "cp",
+            "--python-version",
+            "3.12",
+            "--abi",
+            "cp312",
             "--target",
             str(tmp_path / "install"),
             "-r",
@@ -63,6 +74,14 @@ def test_clean_hash_install_resolves(tmp_path: Path) -> None:
         timeout=180,
     )
     assert completed.returncode == 0, completed.stderr[-1000:]
+
+
+def test_deploy_requires_exact_asyncpg_lambda_wheel_tag() -> None:
+    script = (ROOT / "lambda/deploy.sh").read_text()
+    assert 'root / "asyncpg-0.31.0.dist-info"' in script
+    assert 'tags != {"cp312-cp312-manylinux_2_28_x86_64"}' in script
+    assert "asyncpg wheel metadata missing" in script
+    assert "asyncpg wheel tag mismatch" in script
 
 
 def test_iam_template_is_exact_secret_read() -> None:

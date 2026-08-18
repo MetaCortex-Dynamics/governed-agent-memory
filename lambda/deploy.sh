@@ -117,9 +117,27 @@ PY
 mkdir --mode=0700 "$TMP_DIR/package"
 cmp -s requirements.lock lambda/requirements.txt
 python3.12 -m pip install --disable-pip-version-check --no-input \
-  --only-binary=:all: --platform manylinux2014_x86_64 \
+  --only-binary=:all: --platform manylinux_2_28_x86_64 \
+  --platform manylinux2014_x86_64 \
   --implementation cp --python-version 3.12 --abi cp312 --require-hashes \
   --requirement lambda/requirements.txt --target "$TMP_DIR/package"
+python3.12 - "$TMP_DIR/package" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+dist_info = root / "asyncpg-0.31.0.dist-info"
+wheel = dist_info / "WHEEL"
+if not dist_info.is_dir() or not wheel.is_file():
+    raise SystemExit("lambda-deploy: asyncpg wheel metadata missing")
+tags = {
+    line.removeprefix("Tag: ")
+    for line in wheel.read_text(encoding="utf-8").splitlines()
+    if line.startswith("Tag: ")
+}
+if tags != {"cp312-cp312-manylinux_2_28_x86_64"}:
+    raise SystemExit("lambda-deploy: asyncpg wheel tag mismatch")
+PY
 python3.12 -m pip install --disable-pip-version-check --no-input \
   --no-build-isolation --no-deps --target "$TMP_DIR/package" .
 install -m 0644 lambda/handler.py "$TMP_DIR/package/handler.py"
