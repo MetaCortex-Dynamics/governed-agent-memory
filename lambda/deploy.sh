@@ -138,8 +138,31 @@ tags = {
 if tags != {"cp312-cp312-manylinux_2_28_x86_64"}:
     raise SystemExit("lambda-deploy: asyncpg wheel tag mismatch")
 PY
-python3.12 -m pip install --disable-pip-version-check --no-input \
-  --no-build-isolation --no-deps --target "$TMP_DIR/package" .
+python3.12 - "$TMP_DIR/package" <<'PY'
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+package_root = Path(sys.argv[1])
+completed = subprocess.run(
+    ["git", "ls-files", "-z", "--", "src"],
+    check=True,
+    capture_output=True,
+)
+tracked = [Path(item.decode("utf-8")) for item in completed.stdout.split(b"\0") if item]
+if not tracked or Path("src/__init__.py") not in tracked:
+    raise SystemExit("lambda-deploy: tracked source inventory incomplete")
+for source in tracked:
+    if source.parts[0] != "src" or source.suffix != ".py":
+        raise SystemExit("lambda-deploy: unexpected tracked source path")
+    if source.is_symlink() or not source.is_file():
+        raise SystemExit("lambda-deploy: invalid tracked source file")
+    destination = package_root / source
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    destination.chmod(0o644)
+PY
 install -m 0644 lambda/handler.py "$TMP_DIR/package/handler.py"
 python3.12 - "$TMP_DIR/package" <<'PY'
 import os, sys

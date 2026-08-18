@@ -84,6 +84,17 @@ def test_deploy_requires_exact_asyncpg_lambda_wheel_tag() -> None:
     assert "asyncpg wheel tag mismatch" in script
 
 
+def test_deploy_copies_only_tracked_python_application_sources() -> None:
+    script = (ROOT / "lambda/deploy.sh").read_text()
+    assert '["git", "ls-files", "-z", "--", "src"]' in script
+    assert 'source.suffix != ".py"' in script
+    assert "source.is_symlink() or not source.is_file()" in script
+    assert "shutil.copyfile(source, destination)" in script
+    assert "destination.chmod(0o644)" in script
+    assert "--no-build-isolation" not in script
+    assert '--target "$TMP_DIR/package" .' not in script
+
+
 def test_iam_template_is_exact_secret_read() -> None:
     value = json.loads((ROOT / "lambda/iam-secrets-policy.template.json").read_text())
     assert value == {
