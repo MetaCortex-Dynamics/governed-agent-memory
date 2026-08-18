@@ -29,14 +29,16 @@ chmod 0700 "$TMP_DIR"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 export AWS_PAGER=''
 
+write_pricing_evidence() {
 python3.12 - "$AWS_REGION" "$DEPLOYED_UNTIL_UTC" \
-  "$MAX_ACCEPTED_AWS_ESTIMATE_USD" "$TMP_DIR/pricing-evidence.json" <<'PY'
+  "$MAX_ACCEPTED_AWS_ESTIMATE_USD" "$1" "$2" \
+  "$TMP_DIR/pricing-evidence.json" <<'PY'
 import hashlib, json, sys
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 
-region, deployed_until, cap_text, output = sys.argv[1:]
+region, deployed_until, cap_text, concurrency_text, concurrency_digest, output = sys.argv[1:]
 path = Path("lambda/pricing-input.json")
 raw = path.read_bytes()
 value = json.loads(raw)
@@ -65,22 +67,26 @@ try:
     request_price = Decimal(value["request_price_usd_per_million"])
     duration_price = Decimal(value["duration_price_usd_per_gb_second"])
     cap = Decimal(cap_text)
+    concurrency = Decimal(concurrency_text)
 except (InvalidOperation, TypeError):
     raise SystemExit("lambda-deploy: invalid decimal") from None
-if min(request_price, duration_price, cap) < 0:
+if min(request_price, duration_price, cap) < 0 or concurrency != int(concurrency) or concurrency <= 0:
     raise SystemExit("lambda-deploy: negative price")
 request_rate = request_price / Decimal(1_000_000)
 smoke = Decimal(100) * request_rate + Decimal(1500) * duration_price
 window_seconds = Decimal(hours * 3600)
-continuous_requests = Decimal(2) * (window_seconds / Decimal(30))
-continuous = continuous_requests * request_rate + Decimal(2) * window_seconds * Decimal("0.5") * duration_price
+continuous_requests = concurrency * (window_seconds / Decimal(30))
+continuous = continuous_requests * request_rate + concurrency * window_seconds * Decimal("0.5") * duration_price
 round_up = lambda item: item.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
 if round_up(smoke) > cap or round_up(continuous) > cap:
     raise SystemExit("lambda-deploy: estimate exceeds cap")
 digest_value = {"schema": "gam.aws-pricing.v1", **value}
 evidence = {
     "architecture": "x86_64", "memory_gb": "0.5", "timeout_seconds": 30,
-    "reserved_concurrency": 2, "planned_smoke_invocations": 100,
+    "concurrency_mode": "UNRESERVED_ON_DEMAND",
+    "observed_unreserved_concurrent_executions": int(concurrency),
+    "account_concurrency_evidence_digest": concurrency_digest,
+    "planned_smoke_invocations": 100,
     "deployment_window_hours": hours,
     "regional_request_price": str(request_price),
     "regional_gb_second_price": str(duration_price),
@@ -95,6 +101,7 @@ evidence = {
 }
 Path(output).write_bytes(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode())
 PY
+}
 
 python3.12 - "$APP_SECRET_ARN" "$TMP_DIR/iam-policy.json" \
   "$OPENAI_MODEL" "$DEPLOYED_UNTIL_UTC" "$TMP_DIR/environment.json" <<'PY'
@@ -238,6 +245,78 @@ aws iam list-attached-role-policies --role-name "$LAMBDA_ROLE_NAME" \
   --max-items 100 --no-paginate --output json > "$TMP_DIR/attached.json"
 aws iam list-role-policies --role-name "$LAMBDA_ROLE_NAME" \
   --max-items 100 --no-paginate --output json > "$TMP_DIR/inline.json"
+aws lambda get-account-settings --output json > "$TMP_DIR/account-settings-before.json"
+if aws lambda get-function --function-name governed-agent-memory-fn \
+  > "$TMP_DIR/function-before.json" 2> "$TMP_DIR/function-before.err"; then
+  FUNCTION_PRESENT=yes
+  aws lambda get-function-concurrency --function-name governed-agent-memory-fn \
+    --output json > "$TMP_DIR/concurrency-before.json"
+else
+  grep -q 'ResourceNotFoundException' "$TMP_DIR/function-before.err" || {
+    printf '%s\n' 'lambda-deploy: function lookup failed' >&2
+    exit 1
+  }
+  FUNCTION_PRESENT=no
+  : > "$TMP_DIR/concurrency-before.json"
+fi
+
+mapfile -t CONCURRENCY_EVIDENCE < <(python3.12 - \
+  "$TMP_DIR/account-settings-before.json" "$TMP_DIR/concurrency-before.json" \
+  "$FUNCTION_PRESENT" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+account_path, concurrency_path, function_present = sys.argv[1:]
+try:
+    account = json.loads(Path(account_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit("lambda-deploy: malformed account settings") from None
+if set(account) != {"AccountLimit", "AccountUsage"}:
+    raise SystemExit("lambda-deploy: malformed account settings")
+limits = account.get("AccountLimit")
+usage = account.get("AccountUsage")
+required_limits = {
+    "TotalCodeSize", "CodeSizeUnzipped", "CodeSizeZipped",
+    "ConcurrentExecutions", "UnreservedConcurrentExecutions",
+}
+if not isinstance(limits, dict) or set(limits) != required_limits or not isinstance(usage, dict):
+    raise SystemExit("lambda-deploy: malformed account settings")
+total = limits.get("ConcurrentExecutions")
+unreserved = limits.get("UnreservedConcurrentExecutions")
+if (
+    isinstance(total, bool) or not isinstance(total, int) or total <= 0
+    or isinstance(unreserved, bool) or not isinstance(unreserved, int)
+    or unreserved <= 0 or unreserved > total
+):
+    raise SystemExit("lambda-deploy: invalid account concurrency")
+raw_concurrency = Path(concurrency_path).read_bytes()
+if function_present == "yes":
+    try:
+        concurrency = json.loads(raw_concurrency) if raw_concurrency.strip() else {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SystemExit("lambda-deploy: malformed function concurrency") from None
+    if not isinstance(concurrency, dict) or set(concurrency):
+        raise SystemExit("lambda-deploy: unexpected reserved concurrency")
+elif function_present != "no" or raw_concurrency:
+    raise SystemExit("lambda-deploy: malformed function concurrency")
+evidence = {
+    "ConcurrentExecutions": total,
+    "UnreservedConcurrentExecutions": unreserved,
+}
+digest = hashlib.sha256(
+    json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+print(unreserved)
+print(digest)
+PY
+)
+[[ "${#CONCURRENCY_EVIDENCE[@]}" -eq 2 ]]
+UNRESERVED_CONCURRENCY="${CONCURRENCY_EVIDENCE[0]}"
+ACCOUNT_CONCURRENCY_DIGEST="${CONCURRENCY_EVIDENCE[1]}"
+write_pricing_evidence "$UNRESERVED_CONCURRENCY" "$ACCOUNT_CONCURRENCY_DIGEST"
+PRICING_EVIDENCE_SHA256="$(sha256sum "$TMP_DIR/pricing-evidence.json" | cut -d' ' -f1)"
 
 INLINE_PRESENT="$(python3.12 - "$EXPECTED_AWS_ACCOUNT_ID" "$LAMBDA_ROLE_ARN" \
   "$TMP_DIR/identity.json" "$TMP_DIR/role.json" "$TMP_DIR/attached.json" \
@@ -293,8 +372,7 @@ if json.load(open(description,encoding="utf-8")).get("ARN") != arn:
     raise SystemExit("lambda-deploy: secret identity mismatch")
 PY
 
-if aws lambda get-function --function-name governed-agent-memory-fn \
-  > "$TMP_DIR/function-before.json" 2> "$TMP_DIR/function-before.err"; then
+if [[ "$FUNCTION_PRESENT" == yes ]]; then
   python3.12 - "$TMP_DIR/function-before.json" "$LAMBDA_ROLE_ARN" <<'PY'
 import json,sys
 configuration=json.load(open(sys.argv[1],encoding="utf-8")).get("Configuration",{})
@@ -310,10 +388,6 @@ PY
     --environment "file://$TMP_DIR/environment.json" --logging-config LogFormat=JSON
   aws lambda wait function-updated-v2 --function-name governed-agent-memory-fn
 else
-  grep -q 'ResourceNotFoundException' "$TMP_DIR/function-before.err" || {
-    printf '%s\n' 'lambda-deploy: function lookup failed' >&2
-    exit 1
-  }
   aws lambda create-function --function-name governed-agent-memory-fn \
     --package-type Zip --runtime python3.12 --architectures x86_64 \
     --role "$LAMBDA_ROLE_ARN" --handler handler.lambda_handler \
@@ -348,24 +422,80 @@ fi
 aws lambda get-policy --function-name governed-agent-memory-fn > "$TMP_DIR/function-policy.json"
 aws lambda get-function-configuration --function-name governed-agent-memory-fn \
   > "$TMP_DIR/function-configuration.json"
-aws lambda put-function-concurrency --function-name governed-agent-memory-fn \
-  --reserved-concurrent-executions 2
 aws lambda get-function-concurrency --function-name governed-agent-memory-fn \
-  > "$TMP_DIR/concurrency.json"
+  --output json > "$TMP_DIR/concurrency-final.json"
+aws lambda get-account-settings --output json > "$TMP_DIR/account-settings-final.json"
 
 python3.12 - "$TMP_DIR/function-configuration.json" "$TMP_DIR/url.json" \
-  "$TMP_DIR/function-policy.json" "$TMP_DIR/concurrency.json" <<'PY'
-import json, sys
-configuration,url,policy,concurrency=(json.load(open(p,encoding="utf-8")) for p in sys.argv[1:])
-if configuration.get("Runtime") != "python3.12" or configuration.get("Architectures") != ["x86_64"]:
+  "$TMP_DIR/function-policy.json" "$TMP_DIR/concurrency-final.json" \
+  "$TMP_DIR/account-settings-final.json" "$TMP_DIR/pricing-evidence.json" \
+  "$TMP_DIR/environment.json" "$LAMBDA_ROLE_ARN" "$UNRESERVED_CONCURRENCY" \
+  "$ACCOUNT_CONCURRENCY_DIGEST" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+(
+    configuration_path, url_path, policy_path, concurrency_path,
+    account_path, pricing_path, environment_path, role_arn,
+    expected_unreserved_text, expected_digest,
+) = sys.argv[1:]
+load = lambda path: json.loads(Path(path).read_text(encoding="utf-8"))
+configuration = load(configuration_path)
+url = load(url_path)
+policy = load(policy_path)
+if (
+    configuration.get("Runtime") != "python3.12"
+    or configuration.get("Architectures") != ["x86_64"]
+    or configuration.get("Role") != role_arn
+    or configuration.get("Handler") != "handler.lambda_handler"
+    or configuration.get("Timeout") != 30
+    or configuration.get("MemorySize") != 512
+    or configuration.get("EphemeralStorage") != {"Size": 512}
+    or configuration.get("LoggingConfig", {}).get("LogFormat") != "JSON"
+    or configuration.get("Environment") != load(environment_path)
+):
     raise SystemExit("lambda-deploy: runtime readback mismatch")
 if url.get("AuthType") != "NONE" or url.get("InvokeMode") != "BUFFERED":
     raise SystemExit("lambda-deploy: URL readback mismatch")
 statements=json.loads(policy.get("Policy","{}")).get("Statement",[])
 if {item.get("Sid") for item in statements} != {"UrlPolicyInvokeURL","UrlPolicyInvokeFunction"}:
     raise SystemExit("lambda-deploy: function policy mismatch")
-if concurrency.get("ReservedConcurrentExecutions") != 2:
-    raise SystemExit("lambda-deploy: concurrency mismatch")
+raw_concurrency = Path(concurrency_path).read_bytes()
+try:
+    concurrency = json.loads(raw_concurrency) if raw_concurrency.strip() else {}
+except (UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit("lambda-deploy: malformed function concurrency") from None
+if not isinstance(concurrency, dict) or set(concurrency):
+    raise SystemExit("lambda-deploy: unexpected reserved concurrency")
+account = load(account_path)
+limits = account.get("AccountLimit") if isinstance(account, dict) else None
+if not isinstance(limits, dict):
+    raise SystemExit("lambda-deploy: malformed account settings")
+total = limits.get("ConcurrentExecutions")
+unreserved = limits.get("UnreservedConcurrentExecutions")
+if (
+    isinstance(total, bool) or not isinstance(total, int) or total <= 0
+    or isinstance(unreserved, bool) or not isinstance(unreserved, int)
+    or unreserved <= 0 or unreserved > total
+    or str(unreserved) != expected_unreserved_text
+):
+    raise SystemExit("lambda-deploy: account concurrency changed")
+bound = {"ConcurrentExecutions": total, "UnreservedConcurrentExecutions": unreserved}
+digest = hashlib.sha256(
+    json.dumps(bound, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+if digest != expected_digest:
+    raise SystemExit("lambda-deploy: account concurrency digest mismatch")
+pricing = load(pricing_path)
+if (
+    pricing.get("concurrency_mode") != "UNRESERVED_ON_DEMAND"
+    or pricing.get("observed_unreserved_concurrent_executions") != unreserved
+    or pricing.get("account_concurrency_evidence_digest") != digest
+):
+    raise SystemExit("lambda-deploy: pricing concurrency evidence mismatch")
 PY
 
+printf '%s\n' "lambda-deploy: concurrency-evidence ok mode=UNRESERVED_ON_DEMAND unreserved=${UNRESERVED_CONCURRENCY} account_digest=${ACCOUNT_CONCURRENCY_DIGEST} pricing_sha256=${PRICING_EVIDENCE_SHA256}"
 printf '%s\n' "lambda-deploy: ok package_sha256=${PACKAGE_SHA256}"

@@ -5,9 +5,60 @@ import json
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
+
+
+def _embedded_python_containing(needle: str) -> str:
+    lines = (ROOT / "lambda/deploy.sh").read_text().splitlines()
+    needle_index = next(index for index, line in enumerate(lines) if needle in line)
+    start = max(
+        index for index in range(needle_index + 1) if lines[index].endswith("<<'PY'")
+    )
+    end = next(index for index in range(start + 1, len(lines)) if lines[index] == "PY")
+    return "\n".join(lines[start + 1 : end])
+
+
+def _account_settings(
+    concurrent: object = 10, unreserved: object = 10
+) -> dict[str, object]:
+    return {
+        "AccountLimit": {
+            "TotalCodeSize": 1,
+            "CodeSizeUnzipped": 1,
+            "CodeSizeZipped": 1,
+            "ConcurrentExecutions": concurrent,
+            "UnreservedConcurrentExecutions": unreserved,
+        },
+        "AccountUsage": {},
+    }
+
+
+def _run_concurrency_validator(
+    tmp_path: Path,
+    account: object,
+    concurrency: bytes = b"",
+) -> subprocess.CompletedProcess[str]:
+    account_path = tmp_path / "account.json"
+    concurrency_path = tmp_path / "concurrency.json"
+    account_path.write_text(json.dumps(account))
+    concurrency_path.write_bytes(concurrency)
+    return subprocess.run(  # noqa: S603 - fixed interpreter and embedded code
+        [
+            sys.executable,
+            "-c",
+            _embedded_python_containing("malformed account settings"),
+            str(account_path),
+            str(concurrency_path),
+            "yes",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_runtime_lock_is_distinct_pinned_hashed_and_runtime_only() -> None:
@@ -192,7 +243,9 @@ def test_deploy_inventory_and_boundaries_are_exact() -> None:
         "--timeout 30",
         "--memory-size 512",
         "--ephemeral-storage Size=512",
-        "--reserved-concurrent-executions 2",
+        "aws lambda get-account-settings",
+        "aws lambda get-function-concurrency",
+        "UNRESERVED_ON_DEMAND",
         "UrlPolicyInvokeURL",
         "UrlPolicyInvokeFunction",
         "AWSLambdaBasicExecutionRole",
@@ -204,6 +257,88 @@ def test_deploy_inventory_and_boundaries_are_exact() -> None:
     assert "OPENAI_API_KEY" not in script
     assert "ListSecrets" not in script
     assert "PutSecretValue" not in script
+    assert "put-function-concurrency" not in script
+
+
+def test_concurrency_evidence_accepts_positive_unreserved_account(
+    tmp_path: Path,
+) -> None:
+    completed = _run_concurrency_validator(tmp_path, _account_settings())
+    assert completed.returncode == 0, completed.stderr
+    records = completed.stdout.splitlines()
+    assert records[0] == "10"
+    assert re.fullmatch(r"[0-9a-f]{64}", records[1])
+
+
+def test_concurrency_evidence_rejects_function_reservation(tmp_path: Path) -> None:
+    completed = _run_concurrency_validator(
+        tmp_path,
+        _account_settings(),
+        json.dumps({"ReservedConcurrentExecutions": 1}).encode(),
+    )
+    assert completed.returncode != 0
+    assert "unexpected reserved concurrency" in completed.stderr
+
+
+def test_concurrency_evidence_rejects_malformed_account_settings(
+    tmp_path: Path,
+) -> None:
+    completed = _run_concurrency_validator(tmp_path, {"AccountLimit": {}})
+    assert completed.returncode != 0
+    assert "malformed account settings" in completed.stderr
+
+
+def test_concurrency_evidence_rejects_zero_and_missing_quota(tmp_path: Path) -> None:
+    zero = _run_concurrency_validator(tmp_path, _account_settings(0, 0))
+    assert zero.returncode != 0
+    assert "invalid account concurrency" in zero.stderr
+    missing = _account_settings()
+    assert isinstance(missing["AccountLimit"], dict)
+    missing["AccountLimit"].pop("UnreservedConcurrentExecutions")
+    absent = _run_concurrency_validator(tmp_path, missing)
+    assert absent.returncode != 0
+    assert "malformed account settings" in absent.stderr
+
+
+def test_observed_concurrency_cost_cap_exceedance_blocks(tmp_path: Path) -> None:
+    output = tmp_path / "pricing.json"
+    until = (datetime.now(UTC) + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and embedded code
+        [
+            sys.executable,
+            "-c",
+            _embedded_python_containing("estimate exceeds cap"),
+            "us-east-2",
+            until,
+            "0",
+            "1",
+            "0" * 64,
+            str(output),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "estimate exceeds cap" in completed.stderr
+    assert not output.exists()
+
+
+def test_concurrency_cost_gate_precedes_every_deployment_mutation() -> None:
+    script = (ROOT / "lambda/deploy.sh").read_text()
+    gate = script.index(
+        'write_pricing_evidence "$UNRESERVED_CONCURRENCY" "$ACCOUNT_CONCURRENCY_DIGEST"'
+    )
+    mutations = (
+        "aws iam put-role-policy",
+        "aws lambda update-function-code",
+        "aws lambda update-function-configuration",
+        "aws lambda create-function ",
+        "aws lambda create-function-url-config",
+        "aws lambda add-permission",
+    )
+    assert all(gate < script.index(mutation) for mutation in mutations)
 
 
 def test_pricing_input_is_concrete_canonical_and_current_contract() -> None:
