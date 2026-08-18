@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import socket
+import ssl
 import threading
 import time
 from dataclasses import asdict, is_dataclass
@@ -16,6 +18,7 @@ from typing import Any, Literal, NoReturn, cast
 from urllib.parse import parse_qsl
 from uuid import UUID
 
+import asyncpg  # type: ignore[import-untyped]
 import openai
 
 import src.agent as agent
@@ -27,6 +30,7 @@ from src.agent import (
     AgentResult,
 )
 from src.ccloud_tool import CLUSTER_NAME
+from src.config import ConfigError
 from src.governance import default_rule_config
 from src.memory import AppMemory, _snapshot_from_json  # noqa: PLC2701
 from src.models import CheckResult, ToolEvidence
@@ -79,6 +83,19 @@ _HEADERS = {
 _SECRET_CACHE: dict[str, str] | None = None
 _SECRET_LOCK = threading.Lock()
 _AGENT_LOCK = threading.Lock()
+_SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
+
+
+class _SecretAccessFailure(RuntimeError):
+    """Secrets Manager access failed without retaining provider context."""
+
+
+class _SecretContentFailure(RuntimeError):
+    """Secret content failed its exact local contract."""
+
+
+class _HealthSqlFailure(RuntimeError):
+    """The health query returned no canonical success witness."""
 
 
 class BoundaryError(ValueError):
@@ -161,14 +178,22 @@ def _load_secret() -> dict[str, str]:
             return dict(_SECRET_CACHE)
         arn = os.environ.get("APP_SECRET_ARN")
         if not arn or arn != arn.strip():
-            raise RuntimeError("secret identifier unavailable")
-        import boto3  # type: ignore[import-not-found]  # AWS runtime SDK
+            raise _SecretAccessFailure("secret identifier unavailable")
+        try:
+            import boto3  # type: ignore[import-not-found]  # AWS runtime SDK
 
-        response = boto3.client("secretsmanager").get_secret_value(SecretId=arn)
+            response = boto3.client("secretsmanager").get_secret_value(SecretId=arn)
+        except Exception:
+            raise _SecretAccessFailure("secret access unavailable") from None
+        if not isinstance(response, dict):
+            raise _SecretContentFailure("secret shape invalid")
         raw = response.get("SecretString")
         if not isinstance(raw, str):
-            raise RuntimeError("secret value unavailable")
-        parsed = json.loads(raw)
+            raise _SecretContentFailure("secret value unavailable")
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            raise _SecretContentFailure("secret shape invalid") from None
         if (
             not isinstance(parsed, dict)
             or frozenset(parsed) != _SECRET_KEYS
@@ -176,7 +201,7 @@ def _load_secret() -> dict[str, str]:
                 not isinstance(parsed[key], str) or not parsed[key] for key in parsed
             )
         ):
-            raise RuntimeError("secret shape invalid")
+            raise _SecretContentFailure("secret shape invalid")
         _SECRET_CACHE = cast(dict[str, str], parsed)
         return dict(_SECRET_CACHE)
 
@@ -221,11 +246,38 @@ async def _health() -> None:
         try:
             async with memory.transaction() as connection:
                 if await connection.fetchrow("SELECT 1 AS reachable") is None:
-                    raise RuntimeError("database unavailable")
+                    raise _HealthSqlFailure("database unavailable")
         finally:
             await memory.close()
 
     await _with_secret_environment(operation)
+
+
+def _health_failure_code(error: BaseException) -> str:
+    if isinstance(error, _SecretAccessFailure):
+        return "SECRET_ACCESS_FAILED"
+    if isinstance(error, _SecretContentFailure):
+        return "SECRET_CONTENT_FAILED"
+    if isinstance(error, ConfigError):
+        return "DB_CONFIG_FAILED"
+    if isinstance(error, socket.gaierror):
+        return "DB_DNS_FAILED"
+    if isinstance(error, (ssl.CertificateError, ssl.SSLError)):
+        return "DB_TLS_FAILED"
+    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+        return "DB_NETWORK_FAILED"
+    if isinstance(error, _HealthSqlFailure):
+        return "DB_SQL_FAILED"
+    if isinstance(error, asyncpg.PostgresError):
+        sqlstate = getattr(error, "sqlstate", None)
+        if not isinstance(sqlstate, str) or _SQLSTATE.fullmatch(sqlstate) is None:
+            return "DB_CONNECT_FAILED"
+        if sqlstate.startswith("28"):
+            return "DB_AUTH_FAILED"
+        if sqlstate.startswith("08"):
+            return "DB_CONNECT_FAILED"
+        return "DB_SQL_FAILED"
+    return "DB_CONNECT_FAILED"
 
 
 async def _demo(profile: str) -> tuple[object, CheckResult]:
@@ -339,6 +391,13 @@ def _public(event: dict[str, object], context: object) -> dict[str, object]:
         except Exception as error:
             if isinstance(error, BoundaryError):
                 raise
+            _safe_log(
+                event_name="health_dependency",
+                schema_version=SCHEMA_VERSION,
+                route_or_operation="/health",
+                status="BLOCKED",
+                error_code_if_any=_health_failure_code(error),
+            )
             _fail("DATABASE_UNAVAILABLE", 503)
         return _response(
             200,

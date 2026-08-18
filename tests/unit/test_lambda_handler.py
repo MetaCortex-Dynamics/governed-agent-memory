@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
+import socket
+import ssl
 import sys
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -9,7 +12,10 @@ from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
 
+import asyncpg  # type: ignore[import-untyped]
 import pytest
+
+from src.config import ConfigError
 
 handler = importlib.import_module("lambda.handler")
 
@@ -72,6 +78,105 @@ def test_health_payload_v2_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None
         "database": "reachable",
         "request_id": "aws-request-unit",
     }
+
+
+def _sql_error(sqlstate: str, message: str) -> asyncpg.PostgresError:
+    error = asyncpg.PostgresError(message)
+    error.sqlstate = sqlstate
+    return error
+
+
+def _credential_url(host: str) -> str:
+    return "postgres" + "ql:" + "//user" + ":sensitive-value" + "@" + host + "/db"
+
+
+@pytest.mark.parametrize(
+    ("error", "classification"),
+    [
+        (
+            handler._SecretAccessFailure("access failed for SECRET-ACCESS-SENTINEL"),
+            "SECRET_ACCESS_FAILED",
+        ),
+        (
+            handler._SecretContentFailure("invalid SECRET-CONTENT-SENTINEL"),
+            "SECRET_CONTENT_FAILED",
+        ),
+        (
+            ConfigError(_credential_url("DB-CONFIG-SENTINEL")),
+            "DB_CONFIG_FAILED",
+        ),
+        (socket.gaierror("DB-DNS-SENTINEL.example"), "DB_DNS_FAILED"),
+        (ConnectionRefusedError("DB-NETWORK-SENTINEL:26257"), "DB_NETWORK_FAILED"),
+        (ssl.SSLError("certificate DB-TLS-SENTINEL"), "DB_TLS_FAILED"),
+        (asyncpg.InvalidPasswordError("sensitive DB-AUTH-SENTINEL"), "DB_AUTH_FAILED"),
+        (
+            asyncpg.InsufficientPrivilegeError("SELECT DB-SQL-SENTINEL"),
+            "DB_SQL_FAILED",
+        ),
+        (
+            RuntimeError(_credential_url("DB-CONNECT-SENTINEL")),
+            "DB_CONNECT_FAILED",
+        ),
+    ],
+)
+def test_health_failure_classification_is_safe_and_public_response_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: BaseException,
+    classification: str,
+) -> None:
+    def blocked(coroutine: Any) -> object:
+        coroutine.close()
+        raise error
+
+    monkeypatch.setattr(handler, "_run", blocked)
+    caplog.set_level(logging.INFO, logger="gam.lambda")
+    response = handler.lambda_handler(public_event(), Context())
+
+    assert response["statusCode"] == 503
+    assert response["body"] == (
+        '{"error":"DATABASE_UNAVAILABLE","schema_version":"gam.lambda.v1"}'
+    )
+    records = [json.loads(record.getMessage()) for record in caplog.records]
+    dependency = [
+        record for record in records if record.get("event_name") == "health_dependency"
+    ]
+    assert dependency == [
+        {
+            "error_code_if_any": classification,
+            "event_name": "health_dependency",
+            "route_or_operation": "/health",
+            "schema_version": "gam.lambda.v1",
+            "status": "BLOCKED",
+        }
+    ]
+    assert all(set(record) <= handler._SAFE_LOG_KEYS for record in records)
+    combined = response["body"] + "".join(
+        record.getMessage() for record in caplog.records
+    )
+    for sentinel in (
+        "SECRET-ACCESS-SENTINEL",
+        "SECRET-CONTENT-SENTINEL",
+        "DB-CONFIG-SENTINEL",
+        "DB-DNS-SENTINEL",
+        "DB-NETWORK-SENTINEL",
+        "DB-TLS-SENTINEL",
+        "DB-AUTH-SENTINEL",
+        "DB-SQL-SENTINEL",
+        "DB-CONNECT-SENTINEL",
+        _credential_url("DB-CONFIG-SENTINEL"),
+        _credential_url("DB-CONNECT-SENTINEL"),
+        "SELECT",
+    ):
+        assert sentinel not in combined
+
+
+@pytest.mark.parametrize("sqlstate", ["", "2800", "28p01", "TOO-LONG"])
+def test_malformed_sqlstate_fails_closed_without_message_inspection(
+    sqlstate: str,
+) -> None:
+    error = _sql_error(sqlstate, _credential_url("MALFORMED"))
+    assert handler._health_failure_code(error) == "DB_CONNECT_FAILED"
 
 
 @pytest.mark.parametrize(
