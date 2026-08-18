@@ -31,6 +31,20 @@ def test_schema_declares_exact_tables_and_vector_index() -> None:
     }
     assert declared == EXPECTED_TABLES
     assert "CREATE VECTOR INDEX idx_proposals_embedding" in sql
+    assert "profile_version STRING NULL UNIQUE" not in sql
+    assert "profile_version STRING NULL," in sql
+    assert (
+        "CREATE INDEX idx_gate_eval_profile_created\n"
+        "    ON gate_evaluations (profile_version, created_at DESC);"
+    ) in sql
+    assert "profile_version IS NULL OR status = 'FINALIZED'" in sql
+    for preserved_constraint in (
+        "gate_eval_profile_state_ck",
+        "gate_eval_digest_ck",
+        "gate_eval_prior_fk",
+        "gate_eval_bound_uq",
+    ):
+        assert preserved_constraint in sql
     assert "VECTOR(1536)" in sql
     assert "CREATE EXTENSION" not in sql
     assert "HNSW" not in sql.upper()
@@ -75,6 +89,53 @@ async def test_schema_inventory_live() -> None:
         assert {row["table_name"] for row in rows} == EXPECTED_TABLES
         assert await connection.fetchval("SELECT current_database()") == (
             "governed_agent_memory"
+        )
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_crdb
+async def test_profile_version_is_non_unique_and_indexed_live() -> None:
+    """The deployed evaluation profile is reusable and has its lookup index."""
+    connection = await asyncpg.connect(dsn=_live_url("DATABASE_URL_SCHEMA_ADMIN"))
+    try:
+        constraints = await connection.fetch(
+            """
+            SELECT tc.constraint_type, kcu.column_name
+              FROM information_schema.table_constraints AS tc
+              JOIN information_schema.key_column_usage AS kcu
+                ON kcu.constraint_catalog = tc.constraint_catalog
+               AND kcu.constraint_schema = tc.constraint_schema
+               AND kcu.constraint_name = tc.constraint_name
+             WHERE tc.table_schema = 'public'
+               AND tc.table_name = 'gate_evaluations'
+            """
+        )
+        assert not any(
+            row["constraint_type"] == "UNIQUE"
+            and row["column_name"] == "profile_version"
+            for row in constraints
+        )
+        indexes = await connection.fetch("SHOW INDEX FROM gate_evaluations")
+        profile_index = sorted(
+            (
+                int(row["seq_in_index"]),
+                row["column_name"],
+                row["direction"],
+            )
+            for row in indexes
+            if row["index_name"] == "idx_gate_eval_profile_created"
+            and not row["storing"]
+        )
+        assert profile_index == [
+            (1, "profile_version", "ASC"),
+            (2, "created_at", "DESC"),
+        ]
+        assert all(
+            row["non_unique"]
+            for row in indexes
+            if row["index_name"] == "idx_gate_eval_profile_created"
         )
     finally:
         await connection.close()

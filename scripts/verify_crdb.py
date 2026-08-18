@@ -46,6 +46,18 @@ TABLES = (
     "proposals",
     "tool_evidence",
 )
+PROFILE_CONSTRAINTS_STATEMENT = """
+            SELECT tc.constraint_name, tc.constraint_type, kcu.column_name
+              FROM information_schema.table_constraints AS tc
+              JOIN information_schema.key_column_usage AS kcu
+                ON kcu.constraint_catalog = tc.constraint_catalog
+               AND kcu.constraint_schema = tc.constraint_schema
+               AND kcu.constraint_name = tc.constraint_name
+             WHERE tc.table_schema = 'public'
+               AND tc.table_name = 'gate_evaluations'
+             ORDER BY tc.constraint_name, kcu.ordinal_position
+            """
+GATE_INDEX_STATEMENT = "SHOW INDEX FROM gate_evaluations"
 ROLES = (
     "gam_reader_role",
     "gam_app_role",
@@ -355,6 +367,8 @@ async def schema_check() -> None:
             """
         )
         indexes = await connection.fetch("SHOW INDEX FROM proposals")
+        gate_constraints = await connection.fetch(PROFILE_CONSTRAINTS_STATEMENT)
+        gate_indexes = await connection.fetch(GATE_INDEX_STATEMENT)
     finally:
         await connection.close()
     if current != DATABASE_NAME:
@@ -364,6 +378,30 @@ async def schema_check() -> None:
     names = {(row["table_name"], row["index_name"]) for row in indexes}
     if ("proposals", "idx_proposals_embedding") not in names:
         blocked("distributed vector index is absent")
+    if any(
+        row["constraint_type"] == "UNIQUE" and row["column_name"] == "profile_version"
+        for row in gate_constraints
+    ):
+        blocked("profile version remains unique")
+    profile_index = sorted(
+        (
+            int(row["seq_in_index"]),
+            str(row["column_name"]),
+            str(row["direction"]),
+        )
+        for row in gate_indexes
+        if row["index_name"] == "idx_gate_eval_profile_created"
+        and not bool(row.get("storing", False))
+    )
+    if profile_index != [
+        (1, "profile_version", "ASC"),
+        (2, "created_at", "DESC"),
+    ] or any(
+        row["index_name"] == "idx_gate_eval_profile_created"
+        and not bool(row["non_unique"])
+        for row in gate_indexes
+    ):
+        blocked("profile-version lookup index mismatch")
 
 
 async def grants_check() -> None:

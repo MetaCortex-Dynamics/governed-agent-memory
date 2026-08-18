@@ -63,7 +63,7 @@ CREATE TABLE gate_evaluations (
     rule_config_digest STRING(64) NOT NULL,
     input_snapshot JSONB NOT NULL,
     input_snapshot_digest STRING(64) NOT NULL,
-    profile_version STRING NULL UNIQUE,
+    profile_version STRING NULL,
     policy_snapshot JSONB NOT NULL,
     policy_digest STRING(64) NOT NULL,
     similarity_threshold DECIMAL(5,4) NOT NULL DEFAULT 0.8500,
@@ -594,6 +594,8 @@ CREATE INDEX idx_proposals_action_target
     ON proposals (action_type_key, target_key);
 CREATE INDEX idx_gate_eval_proposal_created
     ON gate_evaluations (proposal_id, created_at DESC);
+CREATE INDEX idx_gate_eval_profile_created
+    ON gate_evaluations (profile_version, created_at DESC);
 CREATE INDEX idx_decisions_proposal
     ON decisions (proposal_id);
 CREATE INDEX idx_dependency_facts_latest

@@ -22,6 +22,18 @@ TABLE_INVENTORY_STATEMENT = """
              ORDER BY table_name
             """
 INDEX_STATEMENT = "SHOW INDEX FROM proposals"
+PROFILE_CONSTRAINTS_STATEMENT = """
+            SELECT tc.constraint_name, tc.constraint_type, kcu.column_name
+              FROM information_schema.table_constraints AS tc
+              JOIN information_schema.key_column_usage AS kcu
+                ON kcu.constraint_catalog = tc.constraint_catalog
+               AND kcu.constraint_schema = tc.constraint_schema
+               AND kcu.constraint_name = tc.constraint_name
+             WHERE tc.table_schema = 'public'
+               AND tc.table_name = 'gate_evaluations'
+             ORDER BY tc.constraint_name, kcu.ordinal_position
+            """
+GATE_INDEX_STATEMENT = "SHOW INDEX FROM gate_evaluations"
 TARGETLESS_INDEX_STATEMENT = "SHOW INDEXES"
 GRANTS_STATEMENT = """
             SELECT grantee, table_name, privilege_type
@@ -82,10 +94,16 @@ class FakeSchemaConnection:
         *,
         current_database: str = "governed_agent_memory",
         index_name: str | None = "idx_proposals_embedding",
+        profile_unique: bool = False,
+        profile_index_name: str | None = "idx_gate_eval_profile_created",
+        profile_index_non_unique: bool = True,
     ) -> None:
         self.table_names = table_names
         self.current_database = current_database
         self.index_name = index_name
+        self.profile_unique = profile_unique
+        self.profile_index_name = profile_index_name
+        self.profile_index_non_unique = profile_index_non_unique
         self.calls: list[tuple[str, str]] = []
         self.closed = False
 
@@ -95,7 +113,7 @@ class FakeSchemaConnection:
             raise AssertionError(f"unexpected fetchval statement: {statement!r}")
         return self.current_database
 
-    async def fetch(self, statement: str) -> list[dict[str, str]]:
+    async def fetch(self, statement: str) -> list[dict[str, object]]:
         self.calls.append(("fetch", statement))
         if TARGETLESS_INDEX_STATEMENT in statement:
             raise AssertionError("targetless index discovery must never be queried")
@@ -106,6 +124,33 @@ class FakeSchemaConnection:
                 return []
             return [
                 {"table_name": "proposals", "index_name": self.index_name},
+            ]
+        if statement == PROFILE_CONSTRAINTS_STATEMENT:
+            if not self.profile_unique:
+                return []
+            return [
+                {
+                    "constraint_name": "gate_evaluations_profile_version_key",
+                    "constraint_type": "UNIQUE",
+                    "column_name": "profile_version",
+                }
+            ]
+        if statement == GATE_INDEX_STATEMENT:
+            if self.profile_index_name is None:
+                return []
+            return [
+                {
+                    "index_name": self.profile_index_name,
+                    "seq_in_index": sequence,
+                    "column_name": column,
+                    "direction": direction,
+                    "storing": False,
+                    "non_unique": self.profile_index_non_unique,
+                }
+                for sequence, column, direction in (
+                    (1, "profile_version", "ASC"),
+                    (2, "created_at", "DESC"),
+                )
             ]
         raise AssertionError(f"unexpected fetch statement: {statement!r}")
 
@@ -214,6 +259,9 @@ async def run_schema_check(
     current_database: str = "governed_agent_memory",
     table_names: tuple[str, ...] | None = None,
     index_name: str | None = "idx_proposals_embedding",
+    profile_unique: bool = False,
+    profile_index_name: str | None = "idx_gate_eval_profile_created",
+    profile_index_non_unique: bool = True,
 ) -> tuple[dict[str, Any], FakeSchemaConnection]:
     """Run schema_check against an isolated in-memory connection."""
     namespace = verifier()
@@ -222,6 +270,9 @@ async def run_schema_check(
         expected_tables,
         current_database=current_database,
         index_name=index_name,
+        profile_unique=profile_unique,
+        profile_index_name=profile_index_name,
+        profile_index_non_unique=profile_index_non_unique,
     )
 
     async def connect(*, dsn: str) -> FakeSchemaConnection:
@@ -353,8 +404,62 @@ async def test_schema_check_uses_qualified_index_and_preserves_inventory_checks(
         ("fetchval", "SELECT current_database()"),
         ("fetch", TABLE_INVENTORY_STATEMENT),
         ("fetch", INDEX_STATEMENT),
+        ("fetch", PROFILE_CONSTRAINTS_STATEMENT),
+        ("fetch", GATE_INDEX_STATEMENT),
     ]
     assert all(TARGETLESS_INDEX_STATEMENT not in call[1] for call in connection.calls)
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+async def test_schema_check_blocks_unique_profile_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = verifier()
+    connection = FakeSchemaConnection(namespace["TABLES"], profile_unique=True)
+
+    async def connect(*, dsn: str) -> FakeSchemaConnection:
+        assert dsn == SCHEMA_DATABASE_URL
+        return connection
+
+    monkeypatch.setenv("DATABASE_URL_SCHEMA_ADMIN", SCHEMA_DATABASE_URL)
+    monkeypatch.setattr(namespace["asyncpg"], "connect", connect)
+    with pytest.raises(namespace["EvidenceBlocked"], match="remains unique"):
+        await namespace["schema_check"]()
+
+    assert connection.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile_index_name", "profile_index_non_unique"),
+    (
+        (None, True),
+        ("idx_gate_eval_profile_created_renamed", True),
+        ("idx_gate_eval_profile_created", False),
+    ),
+)
+async def test_schema_check_blocks_missing_renamed_or_unique_profile_index(
+    monkeypatch: pytest.MonkeyPatch,
+    profile_index_name: str | None,
+    profile_index_non_unique: bool,
+) -> None:
+    namespace = verifier()
+    connection = FakeSchemaConnection(
+        namespace["TABLES"],
+        profile_index_name=profile_index_name,
+        profile_index_non_unique=profile_index_non_unique,
+    )
+
+    async def connect(*, dsn: str) -> FakeSchemaConnection:
+        assert dsn == SCHEMA_DATABASE_URL
+        return connection
+
+    monkeypatch.setenv("DATABASE_URL_SCHEMA_ADMIN", SCHEMA_DATABASE_URL)
+    monkeypatch.setattr(namespace["asyncpg"], "connect", connect)
+    with pytest.raises(namespace["EvidenceBlocked"], match="lookup index mismatch"):
+        await namespace["schema_check"]()
+
     assert connection.closed
 
 
