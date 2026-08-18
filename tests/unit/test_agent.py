@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import openai
 import pytest
+from openai.lib._pydantic import to_strict_json_schema
 from pydantic import ValidationError
 
 import src.agent as agent
@@ -74,9 +75,9 @@ def draft(evidence_id: str, **changes: Any) -> dict[str, Any]:
         "reasoning": "The requested report is bounded.",
         "purpose": "Produce a local report.",
         "evidence_refs": (evidence_id,),
-        "predicted_outcome": {"created": True},
-        "parameters": {"format": "json"},
-        "impact_assessment": {"remote_effect": False},
+        "predicted_outcome": '{"created":true}',
+        "parameters": '{"format":"json"}',
+        "impact_assessment": '{"remote_effect":false}',
         "dependency_requests": (),
     }
     value.update(changes)
@@ -230,7 +231,7 @@ async def test_authority_field_and_unknown_evidence_fail_before_persistence(
 ) -> None:
     result, memory, _, _ = await run(
         monkeypatch,
-        draft("not-allowlisted", parameters={"verdict": "YES"}),
+        draft("not-allowlisted", parameters='{"verdict":"YES"}'),
     )
     assert isinstance(result, AgentBlockedResult)
     assert result.stage == "OPENAI"
@@ -313,3 +314,39 @@ def test_schema_forbids_model_authority_fields() -> None:
     item = evidence()
     with pytest.raises(ValidationError):
         ProposalDraftSchema.model_validate(draft(item.evidence_id, verdict="YES"))
+
+
+def test_openai_strict_schema_has_only_concrete_closed_types() -> None:
+    schema = to_strict_json_schema(ProposalDraftSchema)
+
+    def inspect(value: object) -> None:
+        if isinstance(value, dict):
+            assert value
+            if value.get("type") == "object":
+                properties = value.get("properties")
+                assert isinstance(properties, dict)
+                assert value.get("additionalProperties") is False
+                assert set(value.get("required", ())) == set(properties)
+            for item in value.values():
+                inspect(item)
+        elif isinstance(value, list):
+            for item in value:
+                inspect(item)
+
+    inspect(schema)
+    rendered = str(schema)
+    assert "Any" not in rendered
+
+
+def test_json_text_fields_reject_unstructured_values_and_non_object_parameters() -> (
+    None
+):
+    item = evidence()
+    for field in ("predicted_outcome", "parameters", "impact_assessment"):
+        with pytest.raises(ValidationError):
+            ProposalDraftSchema.model_validate(draft(item.evidence_id, **{field: {}}))
+    parsed = ProposalDraftSchema.model_validate(
+        draft(item.evidence_id, parameters='["not","an","object"]')
+    )
+    with pytest.raises(agent.AgentContractError, match="parameters"):
+        agent._draft(parsed, frozenset({item.evidence_id}))

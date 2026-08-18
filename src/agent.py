@@ -284,7 +284,11 @@ class DependencyRequestSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
     dependency_key: str = Field(min_length=1, max_length=128)
     predicate: str = Field(min_length=1, max_length=256)
-    expected_json: Any
+    expected_json: str = Field(
+        min_length=1,
+        max_length=4096,
+        description="A JSON-encoded expected value.",
+    )
     necessary_for_yes: bool
     sufficient_if_true: bool
 
@@ -296,9 +300,21 @@ class ProposalDraftSchema(BaseModel):
     reasoning: str = Field(min_length=1, max_length=4096)
     purpose: str = Field(min_length=1, max_length=1024)
     evidence_refs: tuple[str, ...] = Field(max_length=64)
-    predicted_outcome: Any
-    parameters: dict[str, Any]
-    impact_assessment: Any
+    predicted_outcome: str = Field(
+        min_length=1,
+        max_length=4096,
+        description="A JSON-encoded predicted outcome.",
+    )
+    parameters: str = Field(
+        min_length=2,
+        max_length=4096,
+        description="A JSON-encoded object containing action parameters.",
+    )
+    impact_assessment: str = Field(
+        min_length=1,
+        max_length=4096,
+        description="A JSON-encoded impact assessment.",
+    )
     dependency_requests: tuple[DependencyRequestSchema, ...] = Field(max_length=32)
 
 
@@ -330,6 +346,36 @@ def _canonical(value: object, *, require_object: bool = False) -> CanonicalJson:
     return CanonicalJson(raw, canonical_sha256(normalized))
 
 
+def _canonical_json_text(
+    value: str, *, name: str, require_object: bool = False
+) -> CanonicalJson:
+    def reject_constant(_: str) -> NoReturn:
+        _reject(f"{name} contains a non-finite number")
+
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        normalized: set[str] = set()
+        for key, item in pairs:
+            canonical_key = unicodedata.normalize("NFC", key)
+            if key in result or canonical_key in normalized:
+                _reject(f"{name} contains a duplicate object key")
+            result[key] = item
+            normalized.add(canonical_key)
+        return result
+
+    try:
+        parsed = json.loads(
+            value,
+            parse_float=Decimal,
+            parse_int=Decimal,
+            parse_constant=reject_constant,
+            object_pairs_hook=object_pairs,
+        )
+    except (json.JSONDecodeError, UnicodeError, TypeError):
+        raise AgentContractError(f"{name} is not valid JSON") from None
+    return _canonical(parsed, require_object=require_object)
+
+
 def _draft(parsed: object, allowlist: frozenset[str]) -> ProposalDraft:
     try:
         schema = (
@@ -353,7 +399,9 @@ def _draft(parsed: object, allowlist: frozenset[str]) -> ProposalDraft:
             DependencyRequest(
                 key,
                 _text(item.predicate, "dependency predicate", maximum=256),
-                _canonical(item.expected_json).utf8.decode(),
+                _canonical_json_text(
+                    item.expected_json, name="dependency expected value"
+                ).utf8.decode(),
                 item.necessary_for_yes,
                 item.sufficient_if_true,
             )
@@ -365,9 +413,11 @@ def _draft(parsed: object, allowlist: frozenset[str]) -> ProposalDraft:
         _text(schema.reasoning, "reasoning"),
         _text(schema.purpose, "purpose", maximum=1024),
         refs,
-        _canonical(schema.predicted_outcome),
-        _canonical(schema.parameters, require_object=True),
-        _canonical(schema.impact_assessment),
+        _canonical_json_text(schema.predicted_outcome, name="predicted outcome"),
+        _canonical_json_text(
+            schema.parameters, name="proposal parameters", require_object=True
+        ),
+        _canonical_json_text(schema.impact_assessment, name="impact assessment"),
         tuple(dependencies),
     )
 
