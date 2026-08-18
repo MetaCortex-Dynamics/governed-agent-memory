@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,8 +15,9 @@ import time
 from dataclasses import asdict, is_dataclass
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote, urlsplit
 from uuid import UUID
 
 import asyncpg  # type: ignore[import-untyped]
@@ -84,6 +86,14 @@ _SECRET_CACHE: dict[str, str] | None = None
 _SECRET_LOCK = threading.Lock()
 _AGENT_LOCK = threading.Lock()
 _SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
+_COCKROACH_ROOT_SHA256 = (
+    "04cc3f18076b845976384175c7ea45b127de9b66c756ac8fdb148617b9c57a43"
+)
+_CERTIFICATE_BUNDLE = re.compile(
+    rb"(?:-----BEGIN CERTIFICATE-----\n"
+    rb"(?:[A-Za-z0-9+/=]{1,76}\n)+"
+    rb"-----END CERTIFICATE-----(?:\n|\Z))+\Z"
+)
 
 
 class _SecretAccessFailure(RuntimeError):
@@ -96,6 +106,10 @@ class _SecretContentFailure(RuntimeError):
 
 class _HealthSqlFailure(RuntimeError):
     """The health query returned no canonical success witness."""
+
+
+class _DatabaseTlsRootFailure(RuntimeError):
+    """The packaged TLS trust root failed its exact runtime binding."""
 
 
 class BoundaryError(ValueError):
@@ -222,11 +236,56 @@ def _agent_config() -> AgentConfig:
     )
 
 
+def _validated_cockroach_root(
+    path: Path | None = None,
+    expected_digest: str = _COCKROACH_ROOT_SHA256,
+) -> Path:
+    candidate = Path(__file__).with_name("cockroach-root.crt") if path is None else path
+    if candidate.is_symlink() or not candidate.is_file():
+        raise _DatabaseTlsRootFailure("database TLS root unavailable")
+    try:
+        raw = candidate.read_bytes()
+    except OSError:
+        raise _DatabaseTlsRootFailure("database TLS root unavailable") from None
+    if (
+        b"\r" in raw
+        or b"PRIVATE KEY" in raw
+        or _CERTIFICATE_BUNDLE.fullmatch(raw) is None
+    ):
+        raise _DatabaseTlsRootFailure("database TLS root invalid")
+    if hashlib.sha256(raw).hexdigest() != expected_digest:
+        raise _DatabaseTlsRootFailure("database TLS root mismatch")
+    try:
+        ssl.create_default_context(cadata=raw.decode("ascii"))
+    except (UnicodeDecodeError, ssl.SSLError, ValueError):
+        raise _DatabaseTlsRootFailure("database TLS root invalid") from None
+    return candidate.resolve(strict=True)
+
+
+def _database_url_with_root(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except (TypeError, ValueError):
+        raise _DatabaseTlsRootFailure("database TLS URL invalid") from None
+    ssl_modes = [item for name, item in pairs if name == "sslmode"]
+    if ssl_modes != ["verify-full"] or any(name == "sslrootcert" for name, _ in pairs):
+        raise _DatabaseTlsRootFailure("database TLS URL conflict")
+    certificate = quote(str(_validated_cockroach_root()), safe="")
+    prefix, marker, fragment = value.partition("#")
+    suffix = marker + fragment if marker else ""
+    return f"{prefix}&sslrootcert={certificate}{suffix}"
+
+
 async def _with_secret_environment(operation: Any) -> object:
     bindings = _load_secret()
+    runtime_bindings = dict(bindings)
+    runtime_bindings["DATABASE_URL_APP"] = _database_url_with_root(
+        bindings["DATABASE_URL_APP"]
+    )
     previous = {key: os.environ.get(key) for key in _SECRET_KEYS}
     try:
-        os.environ.update(bindings)
+        os.environ.update(runtime_bindings)
         return await operation()
     finally:
         for key, value in previous.items():
@@ -260,6 +319,8 @@ def _health_failure_code(error: BaseException) -> str:
         return "SECRET_CONTENT_FAILED"
     if isinstance(error, ConfigError):
         return "DB_CONFIG_FAILED"
+    if isinstance(error, _DatabaseTlsRootFailure):
+        return "DB_TLS_FAILED"
     if isinstance(error, socket.gaierror):
         return "DB_DNS_FAILED"
     if isinstance(error, (ssl.CertificateError, ssl.SSLError)):

@@ -28,6 +28,7 @@ trap 'rm -rf -- "$TMP_DIR"' EXIT
 chmod 0700 "$TMP_DIR"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 export AWS_PAGER=''
+COCKROACH_ROOT_SHA256=04cc3f18076b845976384175c7ea45b127de9b66c756ac8fdb148617b9c57a43
 
 write_pricing_evidence() {
 python3.12 - "$AWS_REGION" "$DEPLOYED_UNTIL_UTC" \
@@ -122,6 +123,32 @@ Path(environment_path).write_bytes(json.dumps(environment, sort_keys=True, separ
 PY
 
 mkdir --mode=0700 "$TMP_DIR/package"
+python3.12 - lambda/cockroach-root.crt "$COCKROACH_ROOT_SHA256" <<'PY'
+import hashlib
+import re
+import ssl
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = sys.argv[2]
+if path.is_symlink() or not path.is_file():
+    raise SystemExit("lambda-deploy: CockroachDB root certificate unavailable")
+raw = path.read_bytes()
+bundle = re.compile(
+    rb"(?:-----BEGIN CERTIFICATE-----\n"
+    rb"(?:[A-Za-z0-9+/=]{1,76}\n)+"
+    rb"-----END CERTIFICATE-----(?:\n|\Z))+\Z"
+)
+if b"\r" in raw or b"PRIVATE KEY" in raw or bundle.fullmatch(raw) is None:
+    raise SystemExit("lambda-deploy: CockroachDB root certificate invalid")
+if hashlib.sha256(raw).hexdigest() != expected:
+    raise SystemExit("lambda-deploy: CockroachDB root certificate digest mismatch")
+try:
+    ssl.create_default_context(cadata=raw.decode("ascii"))
+except (UnicodeDecodeError, ssl.SSLError, ValueError):
+    raise SystemExit("lambda-deploy: CockroachDB root certificate invalid") from None
+PY
 python3.12 -m pip install --disable-pip-version-check --no-input --no-compile \
   --only-binary=:all: --platform manylinux_2_28_x86_64 \
   --platform manylinux2014_x86_64 \
@@ -181,7 +208,9 @@ for source in tracked:
     destination.chmod(0o644)
 PY
 install -m 0644 lambda/handler.py "$TMP_DIR/package/handler.py"
-python3.12 -B - "$TMP_DIR/package" <<'PY'
+install -m 0644 lambda/cockroach-root.crt "$TMP_DIR/package/cockroach-root.crt"
+python3.12 -B - "$TMP_DIR/package" "$COCKROACH_ROOT_SHA256" <<'PY'
+import hashlib
 import importlib
 import importlib.metadata
 import re
@@ -189,6 +218,7 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+expected_certificate_digest = sys.argv[2]
 forbidden_distributions = {
     "bandit", "mypy", "pip-audit", "pytest", "pytest-asyncio", "ruff"
 }
@@ -202,6 +232,14 @@ if installed & forbidden_distributions:
 required_distributions = {"asyncpg", "openai", "pydantic"}
 if not required_distributions <= installed:
     raise SystemExit("lambda-deploy: runtime distribution missing")
+certificate = root / "cockroach-root.crt"
+if (
+    certificate.is_symlink()
+    or not certificate.is_file()
+    or hashlib.sha256(certificate.read_bytes()).hexdigest()
+    != expected_certificate_digest
+):
+    raise SystemExit("lambda-deploy: packaged CockroachDB root certificate mismatch")
 for path in root.rglob("*"):
     if path.is_symlink():
         raise SystemExit("lambda-deploy: package symlink")

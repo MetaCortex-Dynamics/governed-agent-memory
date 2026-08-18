@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import importlib
 import json
 import logging
+import os
 import socket
 import ssl
 import sys
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
@@ -23,6 +27,21 @@ handler = importlib.import_module("lambda.handler")
 @dataclass
 class Context:
     aws_request_id: str = "aws-request-unit"
+
+
+def _handler_path() -> Path:
+    assert handler.__file__ is not None
+    return Path(handler.__file__)
+
+
+def _encoded_database_url() -> str:
+    return (
+        "postgres"
+        + "ql:"
+        + "//encoded%40user"
+        + ":p%2Fass"
+        + "@cluster.example:26257/database"
+    )
 
 
 def public_event(path: str = "/health", **changes: object) -> dict[str, object]:
@@ -78,6 +97,110 @@ def test_health_payload_v2_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None
         "database": "reachable",
         "request_id": "aws-request-unit",
     }
+
+
+def test_cockroach_root_is_exact_public_certificate_bundle() -> None:
+    path = _handler_path().with_name("cockroach-root.crt")
+    raw = path.read_bytes()
+    assert not path.is_symlink()
+    assert hashlib.sha256(raw).hexdigest() == handler._COCKROACH_ROOT_SHA256
+    assert handler._CERTIFICATE_BUNDLE.fullmatch(raw) is not None
+    assert raw.count(b"-----BEGIN CERTIFICATE-----") == 2
+    assert b"PRIVATE KEY" not in raw
+
+
+def test_database_url_adds_only_encoded_explicit_root_before_fragment() -> None:
+    original = (
+        _encoded_database_url()
+        + "?application_name=governed%2Bagent&sslmode=verify-full#preserved"
+    )
+    certificate = handler.quote(
+        str(_handler_path().with_name("cockroach-root.crt").resolve()), safe=""
+    )
+    assert handler._database_url_with_root(original) == (
+        original.removesuffix("#preserved") + f"&sslrootcert={certificate}#preserved"
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "sslmode=require",
+        "sslmode=verify-full&sslmode=verify-full",
+        "sslmode=verify-full&sslrootcert=%2Ftmp%2Froot.crt",
+        "sslmode=verify-full&%73slrootcert=%2Ftmp%2Froot.crt",
+        "sslmode=verify-full&malformed",
+    ],
+)
+def test_database_url_rejects_missing_weak_conflicting_or_malformed_tls(
+    query: str,
+) -> None:
+    suffix = f"?{query}" if query else ""
+    with pytest.raises(handler._DatabaseTlsRootFailure):
+        handler._database_url_with_root(
+            f"postgresql://user@cluster.example/database{suffix}"
+        )
+
+
+def test_cockroach_root_rejects_missing_symlink_private_malformed_and_digest(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing.crt"
+    with pytest.raises(handler._DatabaseTlsRootFailure):
+        handler._validated_cockroach_root(missing)
+
+    valid = _handler_path().with_name("cockroach-root.crt").read_bytes()
+    target = tmp_path / "target.crt"
+    target.write_bytes(valid)
+    symlink = tmp_path / "symlink.crt"
+    symlink.symlink_to(target)
+    with pytest.raises(handler._DatabaseTlsRootFailure):
+        handler._validated_cockroach_root(symlink)
+
+    private = tmp_path / "private.crt"
+    private_bytes = (
+        b"-----BEGIN " + b"PRIVATE KEY-----\nblocked\n-----END " + b"PRIVATE KEY-----"
+    )
+    private.write_bytes(private_bytes)
+    with pytest.raises(handler._DatabaseTlsRootFailure):
+        handler._validated_cockroach_root(
+            private, hashlib.sha256(private_bytes).hexdigest()
+        )
+
+    malformed = tmp_path / "malformed.crt"
+    malformed_bytes = b"-----BEGIN CERTIFICATE-----\nblocked\n-----END CERTIFICATE-----"
+    malformed.write_bytes(malformed_bytes)
+    with pytest.raises(handler._DatabaseTlsRootFailure):
+        handler._validated_cockroach_root(
+            malformed, hashlib.sha256(malformed_bytes).hexdigest()
+        )
+
+    with pytest.raises(handler._DatabaseTlsRootFailure):
+        handler._validated_cockroach_root(target, "0" * 64)
+
+
+def test_secret_value_is_not_mutated_by_runtime_tls_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = {
+        "DATABASE_URL_APP": (_encoded_database_url() + "?sslmode=verify-full"),
+        "OPENAI_API_KEY": "non-secret-unit-value",
+    }
+    original = dict(secret)
+    observed: dict[str, str] = {}
+
+    async def operation() -> None:
+        observed["url"] = os.environ["DATABASE_URL_APP"]
+
+    monkeypatch.setattr(handler, "_load_secret", lambda: secret)
+    monkeypatch.delenv("DATABASE_URL_APP", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    asyncio.run(handler._with_secret_environment(operation))
+    assert secret == original
+    assert observed["url"].startswith(original["DATABASE_URL_APP"] + "&sslrootcert=")
+    assert "DATABASE_URL_APP" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
 
 
 def _sql_error(sqlstate: str, message: str) -> asyncpg.PostgresError:

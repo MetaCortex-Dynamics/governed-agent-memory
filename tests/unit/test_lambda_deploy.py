@@ -3,12 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import ssl
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
+COCKROACH_ROOT_SHA256 = (
+    "04cc3f18076b845976384175c7ea45b127de9b66c756ac8fdb148617b9c57a43"
+)
 
 
 def _embedded_python_containing(needle: str) -> str:
@@ -172,6 +176,60 @@ def test_deploy_requires_exact_asyncpg_lambda_wheel_tag() -> None:
     assert 'tags != {"cp312-cp312-manylinux_2_28_x86_64"}' in script
     assert "asyncpg wheel metadata missing" in script
     assert "asyncpg wheel tag mismatch" in script
+
+
+def test_deploy_pins_validates_and_packages_exact_cockroach_root(
+    tmp_path: Path,
+) -> None:
+    certificate = ROOT / "lambda/cockroach-root.crt"
+    raw = certificate.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == COCKROACH_ROOT_SHA256
+    assert b"PRIVATE KEY" not in raw
+    ssl.create_default_context(cadata=raw.decode("ascii"))
+
+    script = (ROOT / "lambda/deploy.sh").read_text()
+    assert f"COCKROACH_ROOT_SHA256={COCKROACH_ROOT_SHA256}" in script
+    assert (
+        "install -m 0644 lambda/cockroach-root.crt "
+        '"$TMP_DIR/package/cockroach-root.crt"'
+    ) in script
+    assert "packaged CockroachDB root certificate mismatch" in script
+    assert script.index("CockroachDB root certificate digest mismatch") < script.index(
+        "aws sts get-caller-identity"
+    )
+
+    validator = _embedded_python_containing(
+        "CockroachDB root certificate digest mismatch"
+    )
+    accepted = subprocess.run(  # noqa: S603 - fixed interpreter and embedded code
+        [sys.executable, "-c", validator, str(certificate), COCKROACH_ROOT_SHA256],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+
+    private = tmp_path / "private.crt"
+    private.write_text(
+        "-----BEGIN " + "PRIVATE KEY-----\nblocked\n-----END " + "PRIVATE KEY-----",
+        encoding="ascii",
+    )
+    rejected = subprocess.run(  # noqa: S603 - fixed interpreter and embedded code
+        [
+            sys.executable,
+            "-c",
+            validator,
+            str(private),
+            hashlib.sha256(private.read_bytes()).hexdigest(),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "certificate invalid" in rejected.stderr
 
 
 def test_deploy_copies_only_tracked_python_application_sources() -> None:
