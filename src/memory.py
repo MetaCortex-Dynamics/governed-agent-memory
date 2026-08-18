@@ -133,7 +133,15 @@ def _loaded(value: object) -> Any:
 
 
 def _enum[T](value: object, enum_type: type[T]) -> T:
-    raw = _loaded(value)
+    if isinstance(value, str):
+        if value in enum_type.__members__:  # type: ignore[attr-defined]
+            return cast(T, enum_type[value])  # type: ignore[index]
+        try:
+            raw = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise MemoryIntegrityError("stored enum member is invalid") from error
+    else:
+        raw = value
     if isinstance(raw, Mapping) and "$enum" in raw:
         return cast(T, enum_type[cast(str, raw["member"])])  # type: ignore[index]
     if isinstance(raw, str) and raw in enum_type.__members__:  # type: ignore[attr-defined]

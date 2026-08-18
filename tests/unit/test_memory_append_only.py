@@ -19,17 +19,20 @@ from src.memory import (
     AppMemory,
     MemoryConflictError,
     MemoryIntegrityError,
+    _enum,
     _tool_evidence_digest,
     _validate_tool_evidence,
 )
 from src.models import (
     CheckResult,
     ConsequenceReport,
+    DecisionValue,
     ExecutionStatus,
     PriorEvaluationTrace,
     ToolEvidence,
 )
 from src.traces import canonical_sha256, snapshot_digest
+from src.verdict import Risk, Verdict
 
 fixtures: Any = importlib.import_module("tests.unit.test_governance_rules")
 ROOT = Path(__file__).resolve().parents[2]
@@ -193,6 +196,27 @@ def prior_from(snapshot: Any, result: CheckResult) -> PriorEvaluationTrace:
         policy_digest=result.policy_digest,
         trace_digest=result.trace_digest,
     )
+
+
+@pytest.mark.parametrize(
+    ("stored", "enum_type", "expected"),
+    (
+        ("MAYBE", Verdict, Verdict.MAYBE),
+        ("LOW", Risk, Risk.LOW),
+        ("APPROVE", DecisionValue, DecisionValue.APPROVE),
+        ('"MAYBE"', Verdict, Verdict.MAYBE),
+    ),
+)
+def test_database_enum_decoder_accepts_string_columns_and_canonical_json(
+    stored: str, enum_type: type[Any], expected: Any
+) -> None:
+    assert _enum(stored, enum_type) is expected
+
+
+@pytest.mark.parametrize("stored", ("UNKNOWN", '"UNKNOWN"'))
+def test_database_enum_decoder_rejects_unknown_string_member(stored: str) -> None:
+    with pytest.raises(MemoryIntegrityError, match="stored enum member"):
+        _enum(stored, Verdict)
 
 
 @pytest.mark.asyncio
