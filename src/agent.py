@@ -62,6 +62,8 @@ PROMPT_TEMPLATE = """You draft non-authoritative action proposals only.
 Return only the strict ProposalDraft schema. Never decide, approve, promote,
 execute, or provide verdict, risk, trace, witness, receipt, command, credential,
 or authority fields. Evidence references must come from the supplied allowlist.
+Encode predicted_outcome, parameters, impact_assessment, and dependency
+expected_json values as JSON strings. Parameters must decode to a JSON object.
 """
 PROMPT_TEMPLATE_DIGEST = canonical_sha256(PROMPT_TEMPLATE)
 PROFILE_VERSION = "agent-loop/1.1"

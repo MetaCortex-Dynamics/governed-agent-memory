@@ -350,3 +350,64 @@ def test_json_text_fields_reject_unstructured_values_and_non_object_parameters()
     )
     with pytest.raises(agent.AgentContractError, match="parameters"):
         agent._draft(parsed, frozenset({item.evidence_id}))
+
+
+def test_json_text_contract_rejects_malformed_and_invalid_dependency_values() -> None:
+    item = evidence()
+    malformed = ProposalDraftSchema.model_validate(
+        draft(item.evidence_id, predicted_outcome="{")
+    )
+    with pytest.raises(agent.AgentContractError, match="predicted outcome"):
+        agent._draft(malformed, frozenset({item.evidence_id}))
+    invalid_dependency = ProposalDraftSchema.model_validate(
+        draft(
+            item.evidence_id,
+            dependency_requests=(
+                {
+                    "dependency_key": "bounded fact",
+                    "predicate": "equals",
+                    "expected_json": "NaN",
+                    "necessary_for_yes": True,
+                    "sufficient_if_true": False,
+                },
+            ),
+        )
+    )
+    with pytest.raises(agent.AgentContractError, match="dependency expected value"):
+        agent._draft(invalid_dependency, frozenset({item.evidence_id}))
+
+
+def test_schema_rejects_unknown_nested_fields_and_bound_violations() -> None:
+    item = evidence()
+    dependency = {
+        "dependency_key": "bounded fact",
+        "predicate": "equals",
+        "expected_json": "true",
+        "necessary_for_yes": True,
+        "sufficient_if_true": False,
+    }
+    with pytest.raises(ValidationError):
+        ProposalDraftSchema.model_validate(
+            draft(item.evidence_id, dependency_requests=({**dependency, "extra": 1},))
+        )
+    with pytest.raises(ValidationError):
+        ProposalDraftSchema.model_validate(
+            draft(item.evidence_id, parameters="{" + "x" * 4096 + "}")
+        )
+
+
+def test_json_text_digest_binds_semantics_not_string_encoding() -> None:
+    compact = agent._canonical_json_text('{"alpha":1,"beta":[true,null]}', name="unit")
+    spaced = agent._canonical_json_text(
+        '{ "beta": [ true, null ], "alpha": 1 }', name="unit"
+    )
+    assert compact.utf8 == spaced.utf8 == b'{"alpha":1,"beta":[true,null]}'
+    assert compact.digest == spaced.digest
+
+
+def test_prompt_binds_json_string_transport() -> None:
+    assert (
+        "Encode predicted_outcome, parameters, impact_assessment"
+        in agent.PROMPT_TEMPLATE
+    )
+    assert "Parameters must decode to a JSON object." in agent.PROMPT_TEMPLATE
