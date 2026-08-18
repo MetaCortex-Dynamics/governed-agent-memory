@@ -141,9 +141,7 @@ def _plain_json_value(value: object) -> str:
         if not -float("inf") < value < float("inf"):
             raise MemoryIntegrityError("stored JSON number is non-finite")
         return json.dumps(value, allow_nan=False, separators=(",", ":"))
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return "[" + ",".join(_plain_json_value(item) for item in value) + "]"
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
