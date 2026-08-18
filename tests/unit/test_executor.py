@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import uuid4
@@ -29,6 +30,7 @@ from src.models import (
 )
 
 DIGEST = "a" * 64
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def proposal(**changes: object) -> Proposal:
@@ -157,6 +159,24 @@ def test_executor_identity_is_derived_and_accepts_digit_leading_sha256() -> None
             "postgresql://runtime_user@localhost/db?sslmode=verify-full",
             "not-a-digest",
         )
+
+
+def test_append_only_executor_uses_serializable_uniqueness_not_update_locks() -> None:
+    source = (ROOT / "src/executor.py").read_text(encoding="utf-8")
+    schema = (ROOT / "schema/init.sql").read_text(encoding="utf-8")
+    roles = (ROOT / "schema/roles.sql").read_text(encoding="utf-8")
+    assert "FOR UPDATE" not in source
+    assert (
+        "CONSTRAINT demo_kv_one_effect_per_decision_uq UNIQUE (decision_id)" in schema
+    )
+    assert (
+        "CONSTRAINT demo_kv_key_version_uq UNIQUE (effect_key, effect_version)"
+        in schema
+    )
+    assert (
+        "GRANT INSERT ON TABLE demo_kv, execution_attempts, execution_receipts" in roles
+    )
+    assert "GRANT UPDATE" not in roles
 
 
 def test_attempt_digest_binds_timestamps_terminal_and_safe_error_fields() -> None:

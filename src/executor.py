@@ -401,7 +401,6 @@ FROM decisions AS d
 JOIN gate_evaluations AS g ON g.id = d.evaluation_id
 JOIN proposals AS p ON p.id = d.proposal_id
 WHERE d.id = $1::UUID
-FOR UPDATE OF d
 """,
             command.decision_id,
         )
@@ -427,7 +426,7 @@ FOR UPDATE OF d
         prior = await connection.fetchrow(
             """
 SELECT id, effect_version, effect_digest FROM demo_kv
-WHERE effect_key = $1 ORDER BY effect_version DESC LIMIT 1 FOR UPDATE
+WHERE effect_key = $1 ORDER BY effect_version DESC LIMIT 1
 """,
             effect_key,
         )
