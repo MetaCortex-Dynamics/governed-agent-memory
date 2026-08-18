@@ -8,7 +8,7 @@ fi
 : "${FUNCTION_URL:?FUNCTION_URL is required}"
 : "${AWS_REGION:?AWS_REGION is required}"
 [[ "$FUNCTION_URL" == https://*\.lambda-url.*.on.aws/ ]]
-[[ "$AWS_REGION" =~ ^[a-z]{2}-[a-z]+-[0-9]$ ]]
+[[ "$AWS_REGION" == 'us-east-2' ]]
 BASE_URL="${FUNCTION_URL%/}"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TMP_DIR"' EXIT

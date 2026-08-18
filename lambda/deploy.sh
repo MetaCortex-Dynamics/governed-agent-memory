@@ -17,7 +17,7 @@ for name in "${required[@]}"; do
   fi
 done
 [[ "$OPENAI_MODEL" == 'gpt-4.1-mini-2025-04-14' ]]
-[[ "$AWS_REGION" =~ ^[a-z]{2}-[a-z]+-[0-9]$ ]]
+[[ "$AWS_REGION" == 'us-east-2' ]]
 [[ "$EXPECTED_AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
 [[ "$LAMBDA_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]]
 [[ "$LAMBDA_ROLE_ARN" == "arn:aws:iam::${EXPECTED_AWS_ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}" ]]

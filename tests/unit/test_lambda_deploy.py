@@ -110,7 +110,7 @@ def test_pricing_input_is_concrete_canonical_and_current_contract() -> None:
     assert raw == json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     assert value["schema_version"] == "gam.aws-pricing.v1"
     assert value["architecture"] == "x86_64"
-    assert value["aws_region"] == "us-east-1"
+    assert value["aws_region"] == "us-east-2"
     assert value["source_url"] == "https://aws.amazon.com/lambda/pricing/"
     assert re.fullmatch(r"[0-9a-f]{64}", value["source_page_sha256"])
 
@@ -131,6 +131,15 @@ def test_smoke_and_teardown_have_narrow_command_surfaces() -> None:
     assert "delete-function-url-config" in teardown
     assert "delete-function --function-name governed-agent-memory-fn" in teardown
     assert "delete-secret" not in teardown and "delete-role " not in teardown
+    assert "[[ \"$AWS_REGION\" == 'us-east-2' ]]" in smoke
+    assert "[[ \"$AWS_REGION\" == 'us-east-2' ]]" in teardown
+
+
+def test_deploy_region_is_exact_and_does_not_bind_database_region() -> None:
+    script = (ROOT / "lambda/deploy.sh").read_text()
+    assert "[[ \"$AWS_REGION\" == 'us-east-2' ]]" in script
+    assert "us-east-1" not in script
+    assert "DATABASE_URL" not in script
 
 
 def test_obsolete_cluster_target_is_absent_from_executable_lambda_surface() -> None:
