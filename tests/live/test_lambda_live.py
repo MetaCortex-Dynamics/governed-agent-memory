@@ -57,6 +57,15 @@ def test_live_signed_proposal_returns_persisted_identities(tmp_path: Path) -> No
     )
     assert completed.returncode == 0
     value = json.loads(output.read_text())
+    status = value.get("status", "OK")
+    safe_failure = {
+        "status": status,
+        "stage": value.get("stage"),
+        "error_code": value.get("error_code"),
+    }
+    assert status == "OK", json.dumps(
+        safe_failure, sort_keys=True, separators=(",", ":")
+    )
     assert value["schema_version"] == "gam.lambda.v1"
-    assert re.fullmatch(r"[0-9a-f]{64}", value["trace_digest"])
     assert value["proposal_id"] and value["evaluation_id"]
+    assert re.fullmatch(r"[0-9a-f]{64}", value["trace_digest"])
