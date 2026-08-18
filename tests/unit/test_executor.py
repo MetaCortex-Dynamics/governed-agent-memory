@@ -11,6 +11,7 @@ import pytest
 from src.executor import (
     ExecutionBlocked,
     ExecutorConfig,
+    ExecutorMemory,
     _append_error_chain,
     _FailedEffect,
     _validate_effect,
@@ -177,6 +178,37 @@ def test_append_only_executor_uses_serializable_uniqueness_not_update_locks() ->
         "GRANT INSERT ON TABLE demo_kv, execution_attempts, execution_receipts" in roles
     )
     assert "GRANT UPDATE" not in roles
+
+
+@pytest.mark.asyncio
+async def test_receipt_identity_lookup_fully_consumes_and_rejects_ambiguity() -> None:
+    class Connection:
+        def __init__(self) -> None:
+            self.fetch_calls = 0
+            self.fetchrow_calls = 0
+
+        async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
+            self.fetch_calls += 1
+            assert "execution_receipts" in query
+            assert "LIMIT 2" in query
+            return [{"id": "first"}, {"id": "second"}]
+
+        async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
+            self.fetchrow_calls += 1
+            raise AssertionError("the receipt lookup must not open a partial portal")
+
+    connection = Connection()
+    command = DemoExecutionCommand(str(uuid4()), "d" * 64, str(uuid4()))
+    memory = object.__new__(ExecutorMemory)
+    with pytest.raises(ExecutionBlocked, match="receipt identity is ambiguous"):
+        await memory._execute(cast(Any, connection), command)  # noqa: SLF001
+    assert connection.fetch_calls == 1
+    assert connection.fetchrow_calls == 0
+
+
+def test_executor_does_not_enable_preview_multiple_active_portals() -> None:
+    source = (ROOT / "src/executor.py").read_text(encoding="utf-8")
+    assert "multiple_active_portals_enabled" not in source
 
 
 def test_attempt_digest_binds_timestamps_terminal_and_safe_error_fields() -> None:

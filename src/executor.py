@@ -374,7 +374,7 @@ FROM execution_receipts AS r WHERE r.idempotency_key=$1
     async def _execute(
         self, connection: Connection, command: DemoExecutionCommand
     ) -> ExecutionReceipt:
-        existing = await connection.fetchrow(
+        existing_rows = await connection.fetch(
             """
 SELECT r.id AS receipt_id, r.*, r.idempotency_key AS receipt_idempotency_key
 FROM execution_receipts AS r
@@ -384,6 +384,9 @@ ORDER BY r.id LIMIT 2
             command.idempotency_key,
             command.decision_id,
         )
+        if len(existing_rows) > 1:
+            _blocked("execution receipt identity is ambiguous")
+        existing = existing_rows[0] if existing_rows else None
         if existing is not None:
             result = _receipt(existing)
             if (
